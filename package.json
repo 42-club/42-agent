@@ -1,0 +1,23 @@
+{
+  "name": "42-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "example": "npm run build && node dist/examples/minimal.js",
+    "runtime": "npm run build && node dist/examples/runtime-server.js",
+    "cli": "npm run build && node dist/src/channel/cli/main.js"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "typescript": "^5.9.0"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "^3.0.32",
+    "ai": "^7.0.70",
+    "ajv": "^8.20.0",
+    "zod": "^4.4.3"
+  }
+}

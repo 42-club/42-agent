@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.agent-data/
+.env
+apps/web/node_modules/
+apps/web/dist/
+apps/web/.vinext/
+apps/web/.wrangler/
