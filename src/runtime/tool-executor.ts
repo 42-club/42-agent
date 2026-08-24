@@ -19,7 +19,10 @@ export class ToolExecutor {
     runState: RunState,
   ): Promise<void> {
     runState.phase = "tools";
-    runState.toolCalls = calls.map((call) => ({ ...call, status: "pending" }));
+    const duplicate = calls.find((call) =>
+      runState.toolCalls.some((existing) => existing.id === call.id));
+    if (duplicate) throw new Error(`Duplicate tool call ID in run: ${duplicate.id}`);
+    runState.toolCalls.push(...calls.map((call) => ({ ...call, status: "pending" as const })));
     await this.sessions.save(context.session);
 
     const outcomes = new Map<string, { result?: unknown; error?: string }>();

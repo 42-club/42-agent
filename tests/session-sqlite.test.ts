@@ -107,23 +107,49 @@ test("SQLite rewrites message history only when explicitly requested", async () 
   }
 });
 
-test("SQLite executes and restores 1,000 consecutive conversation turns", async () => {
+test("SQLite executes and restores 1,000 conversation turns with tool calls", async () => {
   const directory = await mkdtemp(join(tmpdir(), "42-agent-sqlite-long-chat-"));
   const filename = join(directory, "runtime.sqlite");
   const turnCount = 1_000;
   try {
     const store = new SqliteSessionStore(filename);
+    let toolExecutions = 0;
     const model: ModelClient = {
       async complete({ messages }) {
-        const currentTurn = (messages.length + 1) / 2;
         const latest = messages.at(-1);
-        assert.equal(latest?.role, "user");
-        assert.equal(latest?.content, `turn-${currentTurn}`);
-        return { content: `ack-${currentTurn}` };
+        if (latest?.role === "user") {
+          const currentTurn = (messages.length + 3) / 4;
+          assert.equal(latest.content, `turn-${currentTurn}`);
+          return {
+            content: "",
+            toolCalls: [{
+              id: `call-${currentTurn}`,
+              name: "echo_turn",
+              arguments: { turn: currentTurn },
+            }],
+          };
+        }
+        assert.equal(latest?.role, "tool");
+        const result = JSON.parse(latest.content) as { turn: number };
+        return { content: `ack-${result.turn}` };
       },
     };
     const tools = new ToolRegistry();
     tools.register(new ConversationCompressionTool(model));
+    tools.register({
+      name: "echo_turn",
+      description: "Return the supplied conversation turn.",
+      inputSchema: {
+        type: "object",
+        properties: { turn: { type: "integer", minimum: 1 } },
+        required: ["turn"],
+        additionalProperties: false,
+      },
+      async execute(arguments_) {
+        toolExecutions += 1;
+        return { turn: Number(arguments_.turn) };
+      },
+    });
     const loop = new AgentLoop({
       model,
       tools,
@@ -138,19 +164,33 @@ test("SQLite executes and restores 1,000 consecutive conversation turns", async 
       });
       assert.equal(response, `ack-${turn}`);
     }
+    assert.equal(toolExecutions, turnCount);
     store.close();
 
     const restoredStore = new SqliteSessionStore(filename);
     const restored = await restoredStore.getOrCreate("long-chat");
-    assert.equal(restored.messages.length, turnCount * 2);
+    assert.equal(restored.messages.length, turnCount * 4);
     for (let turn = 1; turn <= turnCount; turn += 1) {
-      const offset = (turn - 1) * 2;
+      const offset = (turn - 1) * 4;
       assert.equal(restored.messages[offset]?.content, `turn-${turn}`);
-      assert.equal(restored.messages[offset + 1]?.content, `ack-${turn}`);
+      assert.equal(
+        (restored.messages[offset + 1]?.metadata?.toolCalls as Array<{ id: string }>)[0]?.id,
+        `call-${turn}`,
+      );
+      assert.deepEqual(JSON.parse(restored.messages[offset + 2]?.content ?? ""), { turn });
+      assert.equal(restored.messages[offset + 3]?.content, `ack-${turn}`);
     }
     assert.equal(restored.runState?.status, "completed");
-    assert.equal(restored.version, turnCount * 3);
+    assert.equal(restored.version, turnCount * 8);
     restoredStore.close();
+
+    const observer = new DatabaseSync(filename);
+    assert.equal(observer.prepare("SELECT COUNT(*) AS count FROM runs").get()?.count, turnCount);
+    assert.equal(
+      observer.prepare("SELECT COUNT(*) AS count FROM tool_calls").get()?.count,
+      turnCount,
+    );
+    observer.close();
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

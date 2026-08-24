@@ -146,7 +146,6 @@ export class AgentLoop {
         throwIfAborted(input.signal);
         runState.round = round;
         runState.phase = "model";
-        runState.toolCalls = [];
         touch(runState);
         await this.dependencies.sessionStore.save(session);
         await events.emit({
