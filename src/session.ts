@@ -42,7 +42,12 @@ export interface RunState {
 
 export interface SessionStore {
   getOrCreate(sessionId: string): Promise<Session>;
-  save(session: Session): Promise<void>;
+  save(session: Session, options?: SaveSessionOptions): Promise<void>;
+}
+
+export interface SaveSessionOptions {
+  /** Replace persisted message history. Reserved for operations such as compression. */
+  rewriteMessages?: boolean;
 }
 
 export class InMemorySessionStore implements SessionStore {
@@ -57,7 +62,7 @@ export class InMemorySessionStore implements SessionStore {
     return session;
   }
 
-  async save(session: Session): Promise<void> {
+  async save(session: Session, _options?: SaveSessionOptions): Promise<void> {
     session.version = (session.version ?? 0) + 1;
     this.sessions.set(session.id, session);
   }

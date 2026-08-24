@@ -132,8 +132,13 @@ export class AgentLoop {
         || (this.dependencies.config?.compressionThreshold !== undefined && session.messages.length >= this.compressionThreshold)) {
         const compression = this.dependencies.tools.get("compress_conversation");
         this.dependencies.tools.validate(compression.name, {});
-        await compression.execute({}, this.dependencies.tools.contextFor(compression, toolContext));
-        await this.dependencies.sessionStore.save(session);
+        const result = await compression.execute(
+          {},
+          this.dependencies.tools.contextFor(compression, toolContext),
+        ) as { compressed?: boolean };
+        await this.dependencies.sessionStore.save(session, {
+          rewriteMessages: result.compressed === true,
+        });
       }
 
       const systemPrompt = await this.resolveSystemPrompt(input);

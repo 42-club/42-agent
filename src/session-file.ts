@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { Session, SessionStore } from "./session.js";
+import type { SaveSessionOptions, Session, SessionStore } from "./session.js";
 
 /** Durable store for a single Runtime Service process. */
 export class FileSessionStore implements SessionStore {
@@ -28,7 +28,7 @@ export class FileSessionStore implements SessionStore {
     }
   }
 
-  async save(session: Session): Promise<void> {
+  async save(session: Session, _options?: SaveSessionOptions): Promise<void> {
     await mkdir(this.directory, { recursive: true });
     const path = this.pathFor(session.id);
     const temporary = `${path}.${process.pid}.tmp`;

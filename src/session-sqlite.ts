@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { dirname, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
-import type { Message, RunState, Session, SessionStore, ToolCallState } from "./session.js";
+import type { Message, RunState, SaveSessionOptions, Session, SessionStore, ToolCallState } from "./session.js";
 
 /** Durable, transactional store for a single SQLite database. */
 export class SqliteSessionStore implements SessionStore {
@@ -50,7 +50,7 @@ export class SqliteSessionStore implements SessionStore {
     };
   }
 
-  async save(session: Session): Promise<void> {
+  async save(session: Session, options: SaveSessionOptions = {}): Promise<void> {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const existing = this.database.prepare("SELECT version FROM sessions WHERE id = ?").get(
@@ -66,21 +66,38 @@ export class SqliteSessionStore implements SessionStore {
         throw new SessionVersionConflictError(session.id, expected, Number(existing.version));
       }
       const nextVersion = expected + 1;
-      this.database.prepare(
-        "UPDATE sessions SET version = ?, metadata_json = ?, updated_at = ? WHERE id = ?",
-      ).run(nextVersion, JSON.stringify(session.metadata), new Date().toISOString(), session.id);
+      const updated = this.database.prepare(
+        `UPDATE sessions SET version = ?, metadata_json = ?, updated_at = ?
+         WHERE id = ? AND version = ?`,
+      ).run(nextVersion, JSON.stringify(session.metadata), new Date().toISOString(), session.id, expected);
+      if (Number(updated.changes) !== 1) {
+        const actual = this.database.prepare("SELECT version FROM sessions WHERE id = ?")
+          .get(session.id) as { version: number } | undefined;
+        throw new SessionVersionConflictError(session.id, expected, Number(actual?.version ?? -1));
+      }
 
-      this.database.prepare("DELETE FROM messages WHERE session_id = ?").run(session.id);
+      if (options.rewriteMessages) {
+        this.database.prepare("DELETE FROM messages WHERE session_id = ?").run(session.id);
+      }
+      const persistedCount = options.rewriteMessages ? 0 : this.persistedMessageCount(session.id);
+      if (persistedCount > session.messages.length) {
+        throw new Error(
+          `Session ${session.id} message history was shortened without rewriteMessages`,
+        );
+      }
       const insertMessage = this.database.prepare(
         `INSERT INTO messages
          (session_id, sequence, role, content, name, tool_call_id, metadata_json, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       );
-      session.messages.forEach((message, sequence) => insertMessage.run(
-        session.id, sequence, message.role, message.content, message.name ?? null,
-        message.toolCallId ?? null, message.metadata ? JSON.stringify(message.metadata) : null,
-        message.createdAt ?? null,
-      ));
+      for (let sequence = persistedCount; sequence < session.messages.length; sequence += 1) {
+        const message = session.messages[sequence]!;
+        insertMessage.run(
+          session.id, sequence, message.role, message.content, message.name ?? null,
+          message.toolCallId ?? null, message.metadata ? JSON.stringify(message.metadata) : null,
+          message.createdAt ?? null,
+        );
+      }
       if (session.runState) this.saveRun(session.id, session.runState);
       this.database.exec("COMMIT");
       session.version = nextVersion;
@@ -101,15 +118,33 @@ export class SqliteSessionStore implements SessionStore {
        ON CONFLICT(id) DO UPDATE SET status=excluded.status, phase=excluded.phase,
        round=excluded.round, error=excluded.error, updated_at=excluded.updated_at`,
     ).run(run.id, sessionId, run.status, run.phase, run.round, run.error ?? null, run.startedAt, run.updatedAt);
-    this.database.prepare("DELETE FROM tool_calls WHERE run_id = ?").run(run.id);
+    if (run.toolCalls.length === 0) {
+      this.database.prepare("DELETE FROM tool_calls WHERE run_id = ?").run(run.id);
+    } else {
+      const placeholders = run.toolCalls.map(() => "?").join(", ");
+      this.database.prepare(
+        `DELETE FROM tool_calls WHERE run_id = ? AND id NOT IN (${placeholders})`,
+      ).run(run.id, ...run.toolCalls.map((call) => call.id));
+    }
     const insert = this.database.prepare(
       `INSERT INTO tool_calls (id, run_id, call_index, name, arguments_json, status, result_json, error)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(run_id, id) DO UPDATE SET
+       call_index=excluded.call_index, name=excluded.name,
+       arguments_json=excluded.arguments_json, status=excluded.status,
+       result_json=excluded.result_json, error=excluded.error`,
     );
     run.toolCalls.forEach((call, index) => insert.run(
       call.id, run.id, index, call.name, JSON.stringify(call.arguments), call.status,
       call.result === undefined ? null : JSON.stringify(call.result), call.error ?? null,
     ));
+  }
+
+  private persistedMessageCount(sessionId: string): number {
+    const row = this.database.prepare(
+      "SELECT COUNT(*) AS count FROM messages WHERE session_id = ?",
+    ).get(sessionId) as { count: number };
+    return Number(row.count);
   }
 
   private loadRun(row: Record<string, unknown>): RunState {
