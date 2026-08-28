@@ -2,7 +2,7 @@ import Ajv2020, { type ValidateFunction } from "ajv/dist/2020.js";
 import type { ToolDefinition } from "../model.js";
 import type { ReadonlySession, Session } from "../session.js";
 
-export type ApprovalHandler = (question: string) => Promise<boolean>;
+export type ApprovalHandler = (question: string, signal?: AbortSignal) => Promise<boolean>;
 
 export interface ToolContext {
   /** Deeply immutable snapshot. It never aliases the Runtime's live Session. */
@@ -74,7 +74,14 @@ export class ToolRegistry {
   contextFor(tool: Tool, context: ToolExecutionContext): ToolContext {
     return {
       session: immutableSessionSnapshot(context.session),
-      requestApproval: context.requestApproval,
+      // Tools keep the ergonomic one-argument API while the host approval
+      // transport receives the canonical turn signal automatically.
+      requestApproval: (question, signal) => {
+        const approvalSignal = context.signal && signal
+          ? AbortSignal.any([context.signal, signal])
+          : signal ?? context.signal;
+        return context.requestApproval(question, approvalSignal);
+      },
       signal: context.signal,
       mutableSession: tool.sessionAccess === "write" ? context.session : undefined,
     };

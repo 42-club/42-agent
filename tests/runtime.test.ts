@@ -5,6 +5,7 @@ import {
   AgentLoop,
   ConversationCompressionTool,
   InMemorySessionStore,
+  ModelRunner,
   type ModelClient,
   type ModelRequest,
   type ModelResponse,
@@ -49,6 +50,138 @@ test("emits streaming deltas and persists the final response", async () => {
   assert.equal(output, "hello");
   assert.deepEqual(deltas, ["hel", "lo"]);
   assert.equal((await store.getOrCreate("stream")).runState?.status, "completed");
+});
+
+test("rejects a stream that reaches EOF without an explicit done event", async () => {
+  const model: ModelClient = {
+    async complete() {
+      throw new Error("stream should be used");
+    },
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "text_delta", delta: "partial" };
+    },
+  };
+  const store = new InMemorySessionStore();
+
+  await assert.rejects(
+    createLoop(model, store).runTurn({ sessionId: "incomplete-stream", userInput: "go" }),
+    /Model stream ended before a done event/,
+  );
+  const session = await store.get("incomplete-stream");
+  assert.equal(session?.runState?.status, "failed");
+  assert.deepEqual(session?.messages.map((message) => message.content), ["go"]);
+});
+
+test("rejects an unknown model stream event instead of treating it as done", async () => {
+  const model: ModelClient = {
+    async complete() {
+      throw new Error("stream should be used");
+    },
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "future-event" } as unknown as ModelStreamEvent;
+    },
+  };
+
+  await assert.rejects(
+    new ModelRunner(model).run({ messages: [], tools: [], systemPrompt: "" }),
+    /Unknown model stream event type: future-event/,
+  );
+});
+
+test("does not start a model stream for a pre-aborted request", async () => {
+  let streamCalls = 0;
+  const model: ModelClient = {
+    async complete() {
+      throw new Error("stream should be used");
+    },
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      streamCalls += 1;
+      yield { type: "done" };
+    },
+  };
+  const controller = new AbortController();
+  controller.abort(new DOMException("already cancelled", "AbortError"));
+
+  await assert.rejects(
+    new ModelRunner(model).run({
+      messages: [],
+      tools: [],
+      systemPrompt: "",
+      signal: controller.signal,
+    }),
+    { name: "AbortError" },
+  );
+  assert.equal(streamCalls, 0);
+});
+
+test("cancellation after a stream delta wins over a later done event", async () => {
+  const controller = new AbortController();
+  const model: ModelClient = {
+    async complete() {
+      throw new Error("stream should be used");
+    },
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      yield { type: "text_delta", delta: "partial" };
+      yield { type: "done", response: { content: "must not succeed" } };
+    },
+  };
+
+  await assert.rejects(
+    new ModelRunner(model).run({
+      messages: [],
+      tools: [],
+      systemPrompt: "",
+      signal: controller.signal,
+    }, {
+      onTextDelta() {
+        controller.abort(new DOMException("cancel after delta", "AbortError"));
+      },
+    }),
+    { name: "AbortError" },
+  );
+});
+
+test("uses the final done response and stops consuming later stream events", async () => {
+  let reachedAfterDone = false;
+  let iteratorClosed = false;
+  const model: ModelClient = {
+    async complete() {
+      throw new Error("stream should be used");
+    },
+    async *stream(): AsyncIterable<ModelStreamEvent> {
+      try {
+        yield { type: "text_delta", delta: "draft" };
+        yield {
+          type: "tool_call",
+          call: { id: "draft-call", name: "draft", arguments: {} },
+        };
+        yield {
+          type: "done",
+          response: { content: "final", toolCalls: [] },
+        };
+        reachedAfterDone = true;
+        yield { type: "text_delta", delta: "must not be consumed" };
+      } finally {
+        iteratorClosed = true;
+      }
+    },
+  };
+  const deltas: string[] = [];
+
+  const response = await new ModelRunner(model).run({
+    messages: [],
+    tools: [],
+    systemPrompt: "",
+  }, {
+    onTextDelta(delta) {
+      deltas.push(delta);
+    },
+  });
+
+  assert.deepEqual(response, { content: "final", toolCalls: [] });
+  assert.deepEqual(deltas, ["draft"]);
+  assert.equal(reachedAfterDone, false);
+  assert.equal(iteratorClosed, true);
 });
 
 test("retries transient model failures", async () => {

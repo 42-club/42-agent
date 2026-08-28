@@ -1,5 +1,7 @@
 node_modules/
 dist/
+coverage/
+.nyc_output/
 .agent-data/
 .env
 apps/web/node_modules/

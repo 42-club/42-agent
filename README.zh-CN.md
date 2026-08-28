@@ -34,16 +34,70 @@ Runtime 上层的应用负责 Agent 发现、任务拆解、调度、结果路�
 ## 协议方向
 
 [Agent Client Protocol（ACP）](https://agentclientprotocol.com/) 是应用层 Orchestrator 与每个
-42 Agent 进程之间计划采用的标准协议边界。ACP 应提供 Session 生命周期、Prompt、结构化更新、
-取消、能力协商和权限请求。一个 Orchestrator 可以同时作为多个 Agent 的 ACP Client，对它们进行
-并发协调。
-
-支持 ACP 是设计目标，并非当前已经具备的能力。当前 HTTP 和 CLI Channel 用于演示 Runtime
-边界，但不能替代 ACP 实现。ACP 应位于 `AgentRuntime` 之上的 Adapter 层；协议特有的生命周期和
-消息类型不得泄漏到核心执行模型中。
+42 Agent 进程之间的标准协议边界。仓库内置的 Adapter 使用官方 `@agentclientprotocol/sdk`，在
+`AgentRuntime` 之上实现稳定版 ACP v1；ACP 特有的生命周期与 Wire 类型不会泄漏到核心执行模型。
+一个 Orchestrator 可以同时作为多个独立 Agent 的 ACP Client，对它们进行并发协调。
 
 在本架构中，ACP 是 Client-to-Agent 协议。它不会让多个 Runtime 共享状态，本身也不负责定义
 协作策略；Orchestrator 通过组合多个相互独立的 ACP 连接构建多 Agent 系统。
+
+### ACP Adapter
+
+`createAcpAgent` 提供初始化、Session 新建/恢复/删除、Prompt、取消、有序文本与工具更新，以及可选的
+客户端权限请求。请求取消与 `session/cancel` 都会传递给 Runtime。更新发送由
+`maxPendingUpdates` 和 `updateDeliveryTimeoutMs` 约束顺序、队列和等待时间；客户端停滞时会取消
+Prompt，而不会无限堆积更新。Prompt 支持文本和基础 `resource_link`，后者会转换成明确的文本标记。
+`name`、`title` 与 `version` 用于配置初始化时返回的 Agent 身份。
+
+必填的 `workspaceRoot` 是宿主 Tool 或 Sandbox 已经强制执行的规范根目录。ACP Session 的 `cwd`
+必须解析到同一目录；Adapter 不会动态重配 Tool 根目录。Resume、Prompt 与 Delete 还会要求 Session
+中存储的 `acp.cwd` 完全匹配；缺失或外来的 Workspace Metadata 会被拒绝，且不会泄漏已有 Session
+是否属于其他 Workspace。Resume 与 Prompt 会拒绝不存在的 Session，Delete 则保持幂等。
+`session/cancel` 只影响由当前 Adapter 接纳的 Prompt。要把 Runtime 审批桥接到当前 ACP Client，
+构建 `AgentLoop` 与 ACP Adapter 时必须使用同一个 `AcpPermissionBridge`。下例假设 `model`、`tools`
+和 `sessionStore` 已按 [`examples/minimal.ts`](./examples/minimal.ts) 完成配置：
+
+```ts
+import { Readable, Writable } from "node:stream";
+import { ndJsonStream } from "@agentclientprotocol/sdk";
+import { AgentLoop, AgentRuntime } from "42-agent";
+import { AcpPermissionBridge, createAcpAgent } from "42-agent/acp";
+
+const permissions = new AcpPermissionBridge();
+const loop = new AgentLoop({
+  model,
+  tools,
+  sessionStore,
+  requestApproval: permissions.requestApproval,
+});
+const runtime = new AgentRuntime({ loop });
+await runtime.start();
+
+const app = createAcpAgent(runtime, {
+  workspaceRoot: process.cwd(), // 必须与宿主 Tool/Sandbox 根目录一致。
+  permissionBridge: permissions,
+});
+const connection = app.connect(ndJsonStream(
+  Writable.toWeb(process.stdout),
+  Readable.toWeb(process.stdin),
+));
+try {
+  await connection.closed;
+} finally {
+  await runtime.close();
+}
+```
+
+ACP Transport 由嵌入宿主负责；上例使用官方 SDK 的 NDJSON stdio Stream。Adapter 会在每个
+`AgentApp` 实例中强制只保留一个活动 ACP Client 连接。
+在活动 ACP Prompt 之外，`AcpPermissionBridge` 默认拒绝审批，除非宿主显式提供 fallback 策略。
+`ToolRegistry` 会把规范 Turn Signal 绑定到审批调用；即使 Tool 只等待 `requestApproval`，Runtime
+关闭也能取消待处理的 ACP 权限请求。
+Adapter 会如实声明
+`loadSession: false`，目前不实现 Session 回放/加载、`session/close`、额外工作目录、ACP 托管的 MCP
+Server 生命周期或图片/音频/嵌入资源 Prompt。非空 `mcpServers` 与 `additionalDirectories`
+会被明确拒绝，而不是静默忽略。ACP v1 没有 Message 替换原语；若最终规范结果与已发送 Delta
+不一致，Adapter 会用新的 Message ID 发布最终结果。
 
 ## 非目标
 
@@ -56,9 +110,10 @@ Runtime 上层的应用负责 Agent 发现、任务拆解、调度、结果路�
 - 终端用户认证、租户路由、计费或产品 UI
 - 对具有外部副作用的工具提供 exactly-once 执行保证
 
-项目的核心设计规则是：**Session 独立于 Channel**。任何 Channel 都可以把入站事件解析到同一个
-Session ID，从而加入并继续该 Session。HTTP、Web、CLI 和机器人集成都属于 Channel；它们均不
-拥有或重建会话历史。
+项目的核心设计规则是：**核心 Runtime 不把 Session 绑定到 Channel**。具体 Adapter 仍可在把事件
+解析到 Session ID 前施加入场与所有权策略。HTTP、Web、CLI 和机器人集成都属于 Channel；它们均
+不会重建会话历史。ACP Adapter 只操作其配置 Workspace 内、由 ACP 绑定的 Session，因此跨 Channel
+续接必须经过显式的受信迁移，不能只凭 Session ID。
 
 ```text
 Channel A ─┐
@@ -68,6 +123,7 @@ Channel C ─┘
 
 ## 当前能力
 
+- 基于官方 SDK 的稳定版 ACP v1 Adapter，提供如实能力协商、有界更新、取消和权限桥接
 - 协议无关的 `AgentRuntime` 生命周期，覆盖 Session、Prompt、取消、Steering 和能力查询
 - `AgentRuntime` 从 `AgentLoop` 派生并校验唯一的 `SessionStore`、`ToolRegistry` 与 Skill Loader
 - Runtime、Session 和 Turn 级 Tool/Skill 选择，Prompt 不直接注入能力实现
@@ -93,7 +149,7 @@ Skill Loader，避免校验、执行、关闭与恢复连接到不同的事实�
 
 ## 快速开始
 
-需要 Node.js 22.13 或更高版本。使用内置 SQLite Store 时推荐 Node.js 25。
+需要 Node.js 22.13 或更高版本，推荐使用 Node.js 24 LTS。
 
 ```bash
 npm install
@@ -101,9 +157,22 @@ npm test
 npm run example
 ```
 
-私有包入口已指向 `dist/src/index.js` 及对应类型声明，可通过 workspace 或 tarball 方式嵌入，
-并可使用 `npm pack --dry-run` 做本地消费检查。公开发布到 registry 仍需由项目所有者明确决定
-版本与许可证。
+各项工程检查既可单独运行，也可通过统一的本地门禁执行：
+
+```bash
+npm run lint
+npm run typecheck
+npm run coverage
+npm run check
+```
+
+`npm run coverage` 会运行测试，并对 `dist/src` 强制要求行/语句覆盖率至少 85%、分支至少 75%、
+函数至少 80%。GitHub Actions 会在 Node.js 22.13、24 和 26 上执行 Lint、类型检查、覆盖率门禁及
+`npm pack --dry-run`。
+
+Package 入口指向 `dist/src/index.js` 及对应类型声明，并通过 `42-agent/acp` 暴露 ACP Adapter。
+项目采用 [Apache-2.0](./LICENSE) 许可证，并已配置为可公开发布到 npm。公开发布使用语义化版本，
+且必须由维护者显式执行；`npm pack --dry-run` 只校验发布内容，不会实际发布。
 
 运行由 OpenRouter 提供模型能力的 HTTP Runtime：
 
@@ -153,8 +222,29 @@ Tool 结果必须能够 JSON 序列化；非法结果会成为模型可见的 To
 
 `sessionAccess` 不代表工具没有外部副作用。需要保证外部执行顺序的 Tool 应声明
 `executionPolicy: "exclusive"`；只有允许重叠和乱序的 Tool 才使用默认并行策略。Bash 为独占执行，
-MCP Tool 默认独占，除非显式声明可并行。Tool 参数在执行前会被隔离，Model Client 只接收冻结的
-消息与 Tool Definition 快照。
+Tool 参数在执行前会被隔离，Model Client 只接收冻结的消息与 Tool Definition 快照。
+
+按照 MCP 规范，annotations 只是默认不可信的 Hint。因此，即使 Server 声称
+`readOnlyHint: true`，MCP Tool 默认仍需审批并独占执行。宿主只有在信任已配置 Server 时才能显式
+设置 `trustToolAnnotations: true`；此时明确标为只读的 Tool 才会跳过审批并默认并行。Wire 端提供的
+`executionPolicy` 会被忽略；宿主拥有的顺序覆盖必须通过本地 `executionPolicyFor` 配置：
+
+```ts
+const provider = new MCPToolProvider(client, {
+  trustToolAnnotations: true, // 仅用于宿主明确信任的 Server。
+  executionPolicyFor: ({ name }) => name === "ordered_read" ? "exclusive" : undefined,
+});
+
+const tools = await provider.load({ signal });
+await provider.refresh({ signal });
+await provider.close();
+```
+
+带有 `isError: true` 的 MCP 结果会成为类型明确的 `MCPToolCallError`，不会被当作成功结果；JSON-RPC
+Error Envelope 会成为 `MCPProtocolError`。`MCPToolProvider.close()` 会先阻止新的执行与刷新，等待
+已入场的 `listTools`/`callTool` 请求结束，再关闭 Client，避免因过早断开 Transport 而丢弃已经确认
+的副作用结果。只需要单次快照且由调用方管理 Client 生命周期时，可继续使用便捷的
+`loadMCPTools`。
 
 取消采用协作式语义。Provider、MCP Client 和 Tool 都会收到 `AbortSignal`，Runtime 会等待已启动
 工作结束；需要及时关闭时，实现必须主动响应该信号。可选 `BashTool` 的每个命令都需要显式批准，
@@ -168,8 +258,10 @@ src/agent-runtime.ts    协议无关的生命周期与能力 Facade
 src/agent-loop.ts       编排与 Session 串行化
 src/runtime/            模型执行、重试、事件、Steering 和工具
 src/provider/           Provider Adapter
+src/acp/                基于官方 SDK 的 ACP v1 Adapter、权限桥和更新投影器
 src/channel/            可复用的 Channel Adapter
 src/tools/              本地工具
+src/mcp.ts              MCP Tool 策略、结果规范化、刷新与生命周期
 src/session*.ts         Session 契约和 Store
 examples/               最小示例和 HTTP Runtime 示例
 tests/                  Runtime 与集成测试
@@ -183,5 +275,6 @@ tests/                  Runtime 与集成测试
 只有承担明确 Runtime 开发职责的应用才应进入本仓库，例如未来的 ACP 协议 Inspector。通用聊天
 UI 或平台 Starter 不属于 Runtime。
 
-下一个主要协议里程碑是 ACP Adapter，包括显式 Session 生命周期、结构化更新、取消、能力协商
-和权限桥接。中断运行的检查点续接仍是 Runtime 层面的里程碑。
+稳定版 ACP v1 Adapter 已建立预期的 Client-to-Agent 边界。后续只有在所有权和恢复策略明确后，
+才会考虑增加 Session 回放/加载、更多 Prompt 内容类型或 ACP 托管的 MCP 生命周期。中断运行的
+检查点续接仍是 Runtime 层面的里程碑。

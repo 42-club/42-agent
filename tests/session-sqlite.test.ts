@@ -86,12 +86,14 @@ test("SQLite appends messages and upserts tool calls without rewriting persisted
     session.runState.toolCalls[0]!.result = { ok: true };
     await store.save(session);
 
-    assert.equal(observer.prepare(
+    const messageCount = observer.prepare(
       "SELECT COUNT(*) AS count FROM messages WHERE session_id = ?",
-    ).get(session.id)?.count, 2);
-    assert.equal(observer.prepare(
+    ).get(session.id) as { count: number } | undefined;
+    const toolStatus = observer.prepare(
       "SELECT status FROM tool_calls WHERE run_id = ? AND id = ?",
-    ).get("run-incremental", "call-1")?.status, "completed");
+    ).get("run-incremental", "call-1") as { status: string } | undefined;
+    assert.equal(messageCount?.count, 2);
+    assert.equal(toolStatus?.status, "completed");
     observer.close();
     store.close();
   } finally {
@@ -298,9 +300,15 @@ test("SQLite executes and restores 1,000 conversation turns with tool calls", as
     restoredStore.close();
 
     const observer = new DatabaseSync(filename);
-    assert.equal(observer.prepare("SELECT COUNT(*) AS count FROM runs").get()?.count, turnCount);
+    const runCount = observer.prepare("SELECT COUNT(*) AS count FROM runs").get() as {
+      count: number;
+    } | undefined;
+    const toolCount = observer.prepare("SELECT COUNT(*) AS count FROM tool_calls").get() as {
+      count: number;
+    } | undefined;
+    assert.equal(runCount?.count, turnCount);
     assert.equal(
-      observer.prepare("SELECT COUNT(*) AS count FROM tool_calls").get()?.count,
+      toolCount?.count,
       turnCount,
     );
     observer.close();

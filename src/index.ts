@@ -1,5 +1,6 @@
 export * from "./agent-loop.js";
 export * from "./agent-runtime.js";
+export * from "./acp/index.js";
 export * from "./channel/index.js";
 export * from "./mcp.js";
 export * from "./model.js";

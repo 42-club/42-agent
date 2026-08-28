@@ -32,6 +32,9 @@ export class AiSdkModelClient implements ModelClient {
       tools: toAiTools(request),
       abortSignal: request.signal,
       maxRetries: 0,
+      // Errors are surfaced through fullStream below. Suppress the SDK's
+      // default console reporter so embedding applications own logging.
+      onError: () => undefined,
     });
     for await (const part of result.fullStream) {
       if (part.type === "text-delta") yield { type: "text_delta", delta: part.text };
@@ -42,9 +45,15 @@ export class AiSdkModelClient implements ModelClient {
         };
       } else if (part.type === "error") {
         throw part.error;
+      } else if (part.type === "abort") {
+        throw request.signal?.reason
+          ?? new DOMException(part.reason ?? "AI SDK stream aborted", "AbortError");
+      } else if (part.type === "finish") {
+        yield { type: "done" };
+        return;
       }
     }
-    yield { type: "done" };
+    throw new Error("AI SDK stream ended before a finish event");
   }
 }
 

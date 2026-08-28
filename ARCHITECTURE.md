@@ -5,8 +5,10 @@ session lifecycle, capability selection, cancellation, and close admission. It d
 `SessionStore`, `ToolRegistry`, and Skill loader from `AgentLoop`; supplying different instances is rejected at
 construction. `AgentLoop`, its per-session coordinator, and that Store are the only source of truth for
 conversation and run state.
-Sessions are independent from channels: any channel may continue a session by resolving an inbound event
-to the same session ID.
+The core Runtime does not bind Sessions to channels. A protocol adapter may still enforce admission and
+ownership before resolving an inbound event to a Session ID; ACP, in particular, accepts only ACP-bound
+Sessions in its configured workspace. Cross-channel continuation therefore requires an explicit trusted
+migration rather than possession of an ID alone.
 
 ```text
 ACP / channel/* ──► AgentRuntime
@@ -26,6 +28,8 @@ runtime/*  ◄─────────────┤
 
 - `agent-runtime.ts`: Own explicit session lifecycle, active-run cancellation, steering, and capability
   selection. It contains no ACP, HTTP, CLI, or application-specific types.
+- `acp/`: Adapt stable ACP v1 from the official SDK to `AgentRuntime`, project ordered bounded updates,
+  and optionally bridge protocol permission requests to the Runtime's boolean approval hook.
 - `channel/`: Normalize frontend events, forward streaming events, and send final output. Never store history.
 - `provider/`: Convert canonical messages to provider payloads and normalize provider responses.
 - `runtime/`: Streaming, cooperative cancellation, steering, retry, bounded tool execution, checkpoints,
@@ -35,7 +39,8 @@ runtime/*  ◄─────────────┤
   Write tools execute as exclusive barriers. `sessionAccess` describes only Session mutation; external
   ordering is controlled separately by `executionPolicy`.
 - `skills.ts`: Load optional instructions. A Skill does not own tools, permissions, or sessions.
-- `mcp.ts`: Convert MCP tools into the same Tool interface used by local tools.
+- `mcp.ts`: Convert MCP tools into the same Tool interface used by local tools, apply host-owned trust and
+  ordering policy, normalize failures, and own refresh/close lifecycle when using `MCPToolProvider`.
 - `session.ts`: Canonical messages and durable `RunState`/`ToolCallState`.
 - `agent-loop.ts`: The only core coordinator allowed to admit conversation and run-state mutations.
   Trusted write tools mutate only while executing inside its exclusive tool barrier.
@@ -53,8 +58,35 @@ application-level orchestrator. They do not share in-memory queues or mutable se
 does not provide cluster membership, distributed scheduling, or cross-agent collaboration policy. Each
 process must have its own Store; cross-process sharing of one File or SQLite Store is unsupported.
 
-ACP is the intended client-to-agent protocol boundary. ACP-specific JSON-RPC and wire types belong in a
-future adapter above `AgentRuntime`, not in the canonical session, loop, provider, Tool, or Skill models.
+ACP is the implemented client-to-agent protocol boundary. ACP-specific JSON-RPC and wire types remain in
+the adapter above `AgentRuntime`, not in canonical Session, Loop, Provider, Tool, or Skill models.
+
+## ACP v1 adapter boundary
+
+`createAcpAgent` builds a stable ACP v1 `AgentApp` using the official TypeScript SDK. It negotiates only
+implemented capabilities and maps initialize, session new/resume/delete, prompt, and cancel to
+`AgentRuntime`. It projects ordered text deltas and tool-call state, propagates request and session
+cancellation, and can route approvals through `AcpPermissionBridge`. The embedding application owns the
+transport and Runtime lifecycle; each `AgentApp` enforces one live ACP client connection at a time.
+
+`workspaceRoot` is mandatory and is canonicalized with `realpath`. A session request's `cwd` must resolve
+to that same host-enforced root; symlink aliases are accepted only when their canonical target matches.
+The adapter records the root in Session metadata and verifies it on resume, prompt, and delete. Existing
+Sessions with missing or foreign-root metadata are rejected without disclosing their ownership; missing
+resume/prompt targets fail while delete remains idempotent. Cancel targets only prompts admitted by this
+adapter, and protocol input never widens Tool roots.
+
+Update projection has a bounded pending count and per-delivery timeout. Backpressure, timeout, transport
+failure, request cancellation, session cancellation/deletion, and Runtime shutdown all terminate the
+prompt scope without waiting forever on a client notification or permission request. ACP v1 cannot
+replace an already streamed message; a divergent canonical final response is therefore sent under a new
+message ID. `ToolRegistry` binds the canonical Turn signal to approval calls, so Runtime shutdown also
+cancels a permission request awaited by an otherwise signal-unaware Tool.
+
+The capability surface deliberately excludes session load/replay, `session/close`, additional workspace
+directories, ACP-managed MCP server connections, and image/audio/embedded-resource
+prompts. `resource_link` is preserved as an explicit text marker. Unsupported inputs are rejected at the
+adapter boundary rather than ignored or injected into the Runtime.
 
 ## Concurrency
 
@@ -73,6 +105,17 @@ stops dispatching pending calls, marks them interrupted, and joins every already
 `AbortSignal` can delay shutdown; the Runtime never abandons it or permits its checkpoint to arrive after
 close. A write-access Tool checkpoints the complete message history, so edits to existing messages have
 the same durable meaning in every Store.
+
+MCP server annotations are descriptive hints, not authorization. Without an explicit
+`trustToolAnnotations` host opt-in, every adapted MCP tool requires approval and uses exclusive execution.
+Even with trusted annotations, non-read-only tools retain those safeguards. A wire-provided
+`executionPolicy` cannot weaken ordering; only the local `executionPolicyFor` callback can override it.
+
+`MCPToolProvider` gates new work during close, waits for every admitted `listTools` and `callTool` request
+to settle, and only then closes the underlying client. Concurrent refreshes are generation-ordered so a
+late older response cannot replace a newer snapshot. Cancellation is passed to listing, approval, and
+execution. MCP `isError` results and JSON-RPC error envelopes become typed failures rather than durable
+successes.
 
 Persistence implementations use versions or database transactions, but storage locking is not a
 substitute for semantic ordering. `save` is update-only: it must fail if the Session was deleted or its
@@ -109,3 +152,14 @@ emitting, because a frontend may already have rendered those deltas. Provider ad
 internally before yielding the first event. An adapted client exposes `stream` only when its underlying
 transport actually supports streaming, so non-streaming transports retain the Runtime retry policy.
 The OpenRouter adapter requires its protocol-level `[DONE]` marker and treats premature EOF as failure.
+
+## Verification and distribution
+
+The supported engine floor is Node.js 22.13; Node.js 24 LTS is recommended. CI verifies Node.js 22.13,
+24, and 26 with lint, type-checking, tests, package inspection, and coverage gates of 85% lines/statements,
+75% branches, and 80% functions across production output. Locally, `npm run check` composes lint,
+type-checking, and the coverage-gated test run.
+
+The package is licensed under Apache-2.0 and configured for public npm publication. Public releases use
+semantic versions and require an explicit maintainer publish action; CI and `npm pack --dry-run` verify
+the artifact without publishing it.

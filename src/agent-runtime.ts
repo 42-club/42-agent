@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentLoop, RecoveryResult } from "./agent-loop.js";
 import type { AgentLoopEvent, AgentLoopEventHandler } from "./runtime/events.js";
+import { throwIfAborted } from "./runtime/retry.js";
 import { assertValidSessionId, SessionAlreadyExistsError, type Session, type SessionStore } from "./session.js";
 import type { SkillCatalog, SkillDescriptor, SkillLoader } from "./skills.js";
 import type { ToolDescriptor, ToolRegistry } from "./tools/base.js";
@@ -168,7 +169,7 @@ export class AgentRuntime {
   async capabilities(): Promise<RuntimeCapabilities> {
     return {
       contentTypes: ["text"],
-      streaming: true,
+      streaming: this.dependencies.loop.supportsStreaming,
       cancellation: true,
       steering: true,
       sessionResume: true,
@@ -273,7 +274,10 @@ export class AgentRuntime {
     this.active.set(request.sessionId, runs);
 
     try {
-      const session = await this.resolvePromptSession(request);
+      // Runtime session resolution happens before AgentLoop's FIFO admission,
+      // so it needs its own cancellation barrier before touching the store.
+      throwIfAborted(controller.signal);
+      const session = await this.resolvePromptSession(request, controller.signal);
       const sessionTools = readStringList(session.metadata[SESSION_TOOLS]);
       const sessionSkills = readStringList(session.metadata[SESSION_SKILLS]);
       const tools = selectWithinSession("tool", request.tools, sessionTools);
@@ -397,12 +401,16 @@ export class AgentRuntime {
     operation.resolveSettled();
   }
 
-  private async resolvePromptSession(input: PromptInput): Promise<Session> {
+  private async resolvePromptSession(input: PromptInput, signal: AbortSignal): Promise<Session> {
+    throwIfAborted(signal);
     const existing = await this.dependencies.sessionStore.get(input.sessionId);
+    // Do not turn a cancellation that raced the read into an empty Session.
+    throwIfAborted(signal);
     if (existing) return existing;
     if (!input.createIfMissing) throw new SessionNotFoundError(input.sessionId);
 
     await this.validateSelection(input.tools, input.skills);
+    throwIfAborted(signal);
     try {
       return await this.dependencies.sessionStore.create(
         input.sessionId,
@@ -412,12 +420,14 @@ export class AgentRuntime {
       // Two adapters may admit the first turn concurrently. Whichever loses the
       // create race joins the same runtime-serialized session.
       if (!(error instanceof SessionAlreadyExistsError)) throw error;
-      return this.requireSession(input.sessionId);
+      return this.requireSession(input.sessionId, signal);
     }
   }
 
-  private async requireSession(sessionId: string): Promise<Session> {
+  private async requireSession(sessionId: string, signal?: AbortSignal): Promise<Session> {
+    throwIfAborted(signal);
     const session = await this.dependencies.sessionStore.get(sessionId);
+    throwIfAborted(signal);
     if (!session) throw new SessionNotFoundError(sessionId);
     return session;
   }

@@ -2,7 +2,15 @@
   "name": "42-agent",
   "version": "0.1.0",
   "description": "Protocol-neutral single-process runtime for production AI agents",
-  "private": true,
+  "license": "Apache-2.0",
+  "keywords": [
+    "ai",
+    "agent",
+    "agent-runtime",
+    "acp",
+    "mcp",
+    "typescript"
+  ],
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
@@ -10,6 +18,10 @@
     ".": {
       "types": "./dist/src/index.d.ts",
       "import": "./dist/src/index.js"
+    },
+    "./acp": {
+      "types": "./dist/src/acp/index.d.ts",
+      "import": "./dist/src/acp/index.js"
     },
     "./package.json": "./package.json"
   },
@@ -24,18 +36,29 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test dist/tests/*.test.js",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "npm run build && node --test --test-timeout=60000 dist/tests/*.test.js",
+    "coverage": "npm run build && c8 --all --include='dist/src/**/*.js' --check-coverage --lines 85 --branches 75 --functions 80 --statements 85 node --test --test-timeout=60000 dist/tests/*.test.js",
+    "check": "npm run lint && npm run typecheck && npm run coverage",
     "prepack": "npm run build",
     "example": "npm run build && node dist/examples/minimal.js",
     "runtime": "npm run build && node dist/examples/runtime-server.js",
     "cli": "npm run build && node dist/src/channel/cli/main.js"
   },
   "devDependencies": {
-    "@types/node": "^25.0.0",
-    "typescript": "^5.9.0"
+    "@eslint/js": "^10.0.1",
+    "@types/node": "~22.13.17",
+    "c8": "^12.0.0",
+    "eslint": "^10.9.1",
+    "globals": "^17.11.0",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.68.0"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^1.4.0",
     "@ai-sdk/openai-compatible": "^3.0.32",
     "ai": "^7.0.70",
     "ajv": "^8.20.0",
@@ -44,5 +67,12 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/42-club/42-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/42-club/42-agent/issues"
+  },
+  "homepage": "https://github.com/42-club/42-agent#readme",
+  "publishConfig": {
+    "access": "public"
   }
 }

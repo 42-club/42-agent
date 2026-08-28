@@ -72,6 +72,7 @@ test("AgentRuntime exposes protocol-neutral lifecycle and scoped capabilities", 
   const { runtime } = createRuntime(model);
   const capabilities = await runtime.capabilities();
   assert.deepEqual(capabilities.contentTypes, ["text"]);
+  assert.equal(capabilities.streaming, false);
   assert.deepEqual(capabilities.skills.map((skill) => skill.name), ["review"]);
   assert.deepEqual(capabilities.tools.map((tool) => tool.name), ["echo", "compress_conversation"]);
 
@@ -99,6 +100,19 @@ test("AgentRuntime exposes protocol-neutral lifecycle and scoped capabilities", 
   assert.equal(resumed.metadata.owner, "host-application");
   assert.equal(await runtime.closeSession(created.sessionId), true);
   assert.equal(await runtime.getSession(created.sessionId), undefined);
+});
+
+test("AgentRuntime reports streaming only when the canonical model supports it", async () => {
+  const model: ModelClient = {
+    async complete() {
+      return { content: "unused" };
+    },
+    async *stream() {
+      yield { type: "done" } as const;
+    },
+  };
+
+  assert.equal((await createRuntime(model).runtime.capabilities()).streaming, true);
 });
 
 test("AgentRuntime cancels an active prompt by session ID", async () => {
@@ -405,6 +419,8 @@ test("duplicate capability scopes are rejected before creating or mutating a ses
 
 class DelayedReadSessionStore implements SessionStore {
   private readonly base = new InMemorySessionStore();
+  getCalls = 0;
+  createCalls = 0;
   private nextRead?: {
     entered: () => void;
     wait: Promise<void>;
@@ -420,6 +436,7 @@ class DelayedReadSessionStore implements SessionStore {
   }
 
   async get(sessionId: string): Promise<Session | undefined> {
+    this.getCalls += 1;
     const session = await this.base.get(sessionId);
     const delayed = this.nextRead;
     if (delayed) {
@@ -431,7 +448,12 @@ class DelayedReadSessionStore implements SessionStore {
   }
 
   create(sessionId: string, metadata?: Record<string, unknown>): Promise<Session> {
+    this.createCalls += 1;
     return this.base.create(sessionId, metadata);
+  }
+
+  peek(sessionId: string): Promise<Session | undefined> {
+    return this.base.get(sessionId);
   }
 
   getOrCreate(sessionId: string): Promise<Session> {
@@ -446,6 +468,61 @@ class DelayedReadSessionStore implements SessionStore {
     return this.base.delete(sessionId);
   }
 }
+
+function createRuntimeWithStore(sessionStore: SessionStore): AgentRuntime {
+  const model: ModelClient = {
+    async complete() {
+      throw new Error("model must not be called");
+    },
+  };
+  const loop = new AgentLoop({
+    model,
+    sessionStore,
+    tools: new ToolRegistry(),
+    requestApproval: async () => false,
+  });
+  return new AgentRuntime({ loop });
+}
+
+test("a pre-aborted createIfMissing prompt does not read or create a Session", async () => {
+  const sessionStore = new DelayedReadSessionStore();
+  const runtime = createRuntimeWithStore(sessionStore);
+  const controller = new AbortController();
+  controller.abort(new DOMException("already cancelled", "AbortError"));
+
+  await assert.rejects(runtime.prompt({
+    sessionId: "pre-aborted-create",
+    content: [{ type: "text", text: "must not create" }],
+    createIfMissing: true,
+    signal: controller.signal,
+  }), { name: "AbortError" });
+
+  assert.equal(sessionStore.getCalls, 0);
+  assert.equal(sessionStore.createCalls, 0);
+  assert.equal(await sessionStore.peek("pre-aborted-create"), undefined);
+});
+
+test("cancellation racing createIfMissing Session lookup prevents creation", async () => {
+  const sessionStore = new DelayedReadSessionStore();
+  const runtime = createRuntimeWithStore(sessionStore);
+  const controller = new AbortController();
+  const delayed = sessionStore.delayNextGet();
+  const prompting = runtime.prompt({
+    sessionId: "abort-during-create-read",
+    content: [{ type: "text", text: "must not create" }],
+    createIfMissing: true,
+    signal: controller.signal,
+  });
+
+  await delayed.entered;
+  controller.abort(new DOMException("cancel lookup", "AbortError"));
+  delayed.release();
+
+  await assert.rejects(prompting, { name: "AbortError" });
+  assert.equal(sessionStore.getCalls, 1);
+  assert.equal(sessionStore.createCalls, 0);
+  assert.equal(await sessionStore.peek("abort-during-create-read"), undefined);
+});
 
 test("closeSession gates new prompts and waits for an admitted prompt before deletion", async () => {
   const sessionStore = new DelayedReadSessionStore();

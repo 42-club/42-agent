@@ -30,6 +30,13 @@ export interface ModelClient {
   stream?(request: ModelRequest): AsyncIterable<ModelStreamEvent>;
 }
 
+export type StreamingModelClient = ModelClient & Required<Pick<ModelClient, "stream">>;
+
+/** The stream method itself is the canonical indication that a client can stream. */
+export function supportsModelStreaming(model: ModelClient): model is StreamingModelClient {
+  return typeof model.stream === "function";
+}
+
 export function estimateTokens(text: string): number {
   // Conservative provider-neutral estimate; providers may add an exact counter later.
   return Math.ceil(text.length / 3);

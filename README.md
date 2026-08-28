@@ -38,19 +38,75 @@ production application / orchestrator
 
 ## Protocol direction
 
-[Agent Client Protocol (ACP)](https://agentclientprotocol.com/) is the intended standard boundary
-between an application-level orchestrator and each 42 Agent process. ACP should provide session
-lifecycle, prompts, structured updates, cancellation, capability negotiation, and permission requests.
-An orchestrator can act as the ACP client of several agents and coordinate them concurrently.
-
-ACP support is a design target, not a current capability. The current HTTP and CLI channels demonstrate
-the runtime boundary but are not substitutes for an ACP implementation. ACP belongs in an adapter layer
-above `AgentRuntime`; protocol-specific lifecycle and message types must not leak into the core execution
-model.
+[Agent Client Protocol (ACP)](https://agentclientprotocol.com/) is the standard boundary between an
+application-level orchestrator and each 42 Agent process. The bundled adapter uses the official
+`@agentclientprotocol/sdk` and implements stable ACP v1 over `AgentRuntime`; ACP-specific lifecycle and
+wire types remain outside the core execution model. An orchestrator can act as the ACP client of several
+independent agents and coordinate them concurrently.
 
 ACP is a client-to-agent protocol in this architecture. It does not make the runtimes share state and is
 not itself the collaboration policy: the orchestrator composes independent ACP connections into a
 multi-agent system.
+
+### ACP adapter
+
+`createAcpAgent` exposes initialization, session new/resume/delete, prompt, cancellation, ordered text and
+tool updates, and optional client-side permission requests. Prompt cancellation is forwarded from both
+the request and `session/cancel`. Update delivery is ordered and bounded by `maxPendingUpdates` and
+`updateDeliveryTimeoutMs`; a stalled client cancels the prompt rather than growing an unbounded queue.
+Text and baseline `resource_link` prompt blocks are accepted, with resource links converted to explicit
+text markers. `name`, `title`, and `version` configure the identity returned by initialization.
+
+The required `workspaceRoot` is the canonical root already enforced by the host's tools or sandbox. ACP
+session `cwd` must resolve to that same directory; this adapter does not dynamically reconfigure tool
+roots. Resume, prompt, and delete also require the Session's stored `acp.cwd` to match; missing or foreign
+workspace metadata is rejected without exposing whether an existing Session is foreign. Resume and prompt
+reject a nonexistent Session, while delete remains idempotent. `session/cancel` affects only a prompt
+admitted by this adapter. To bridge Runtime approvals to the active ACP client, use the same `AcpPermissionBridge` when
+constructing both `AgentLoop` and the adapter. The snippet assumes `model`, `tools`, and `sessionStore`
+have been configured as in [`examples/minimal.ts`](./examples/minimal.ts):
+
+```ts
+import { Readable, Writable } from "node:stream";
+import { ndJsonStream } from "@agentclientprotocol/sdk";
+import { AgentLoop, AgentRuntime } from "42-agent";
+import { AcpPermissionBridge, createAcpAgent } from "42-agent/acp";
+
+const permissions = new AcpPermissionBridge();
+const loop = new AgentLoop({
+  model,
+  tools,
+  sessionStore,
+  requestApproval: permissions.requestApproval,
+});
+const runtime = new AgentRuntime({ loop });
+await runtime.start();
+
+const app = createAcpAgent(runtime, {
+  workspaceRoot: process.cwd(), // Must match the host tool/sandbox root.
+  permissionBridge: permissions,
+});
+const connection = app.connect(ndJsonStream(
+  Writable.toWeb(process.stdout),
+  Readable.toWeb(process.stdin),
+));
+try {
+  await connection.closed;
+} finally {
+  await runtime.close();
+}
+```
+
+The embedding host owns the ACP transport; the example uses the official SDK's NDJSON stdio stream. The
+adapter enforces one live ACP client connection per `AgentApp` instance.
+Outside an active ACP prompt, `AcpPermissionBridge` denies by default unless the host supplies an explicit
+fallback policy. `ToolRegistry` binds the canonical Turn signal to approval calls, so Runtime shutdown can
+cancel a pending ACP permission request even when a Tool only awaits `requestApproval`.
+The adapter deliberately reports `loadSession: false` and does not implement session replay/load,
+`session/close`, additional workspace directories, ACP-managed MCP server lifecycles, or
+image/audio/embedded-resource prompt blocks. Non-empty `mcpServers` and `additionalDirectories` are
+rejected instead of being silently ignored. ACP v1 has no message-replacement primitive, so if a final
+canonical response diverges from emitted deltas, it is published under a new message ID.
 
 ## Non-goals
 
@@ -63,9 +119,11 @@ multi-agent system.
 - end-user authentication, tenant routing, billing, or product UI
 - exactly-once execution of tools with external side effects
 
-The central design rule is that **sessions are independent from channels**. Any channel can join and
-continue the same session by resolving an inbound event to the same session ID. HTTP, web, CLI, and
-bot integrations are examples of channels; none of them owns or reconstructs conversation history.
+The central design rule is that **the core Runtime does not bind sessions to channels**. A concrete
+adapter may still impose admission and ownership policy before resolving an event to a Session ID. HTTP,
+web, CLI, and bot integrations are examples of channels; none reconstructs conversation history. The ACP
+adapter operates only on ACP-bound Sessions in its configured workspace, so cross-channel continuation
+requires an explicit trusted migration rather than possession of a Session ID alone.
 
 ```text
 channel A ─┐
@@ -75,6 +133,7 @@ channel C ─┘
 
 ## Current capabilities
 
+- official stable ACP v1 adapter with honest capability negotiation, bounded updates, cancellation, and permission bridging
 - protocol-neutral `AgentRuntime` lifecycle for sessions, prompts, cancellation, steering, and capabilities
 - one canonical `SessionStore`, `ToolRegistry`, and Skill loader, derived from `AgentLoop` and checked at Runtime construction
 - runtime, session, and turn-level Tool/Skill selection without injecting implementations through prompts
@@ -102,7 +161,7 @@ capabilities. See [ARCHITECTURE.md](./ARCHITECTURE.md) for boundaries and recove
 
 ## Quick start
 
-Requires Node.js 22.13 or newer (Node.js 25 is recommended for the built-in SQLite store).
+Requires Node.js 22.13 or newer. Node.js 24 LTS is recommended.
 
 ```bash
 npm install
@@ -110,9 +169,23 @@ npm test
 npm run example
 ```
 
-The private package metadata exposes `dist/src/index.js` and its declarations for workspace or tarball
-consumption. `npm pack --dry-run` can be used as a local consumer check. A public registry release still
-requires an explicit versioning and licensing decision by the project owner.
+Engineering checks are available separately or as one local gate:
+
+```bash
+npm run lint
+npm run typecheck
+npm run coverage
+npm run check
+```
+
+`npm run coverage` runs the test suite and enforces at least 85% lines/statements, 75% branches, and 80%
+functions across `dist/src`. GitHub Actions runs lint, type-checking, coverage gates, and
+`npm pack --dry-run` on Node.js 22.13, 24, and 26.
+
+The package exposes `dist/src/index.js` and its declarations, plus `42-agent/acp` for the ACP adapter.
+It is licensed under [Apache-2.0](./LICENSE) and configured for public npm publication. Public releases
+use semantic versions and remain an explicit maintainer action; `npm pack --dry-run` verifies package
+contents without publishing them.
 
 To run the OpenRouter-backed HTTP runtime:
 
@@ -165,8 +238,31 @@ complete message history so mutations are durable consistently across Store impl
 
 `sessionAccess` says nothing about external side effects. Tools that must preserve external ordering use
 `executionPolicy: "exclusive"`; only tools safe to overlap and reorder should use the default parallel
-policy. Bash is exclusive, and MCP tools default to exclusive unless explicitly marked parallel. Tool-call
-arguments are detached before execution, and Model clients receive frozen message/definition snapshots.
+policy. Bash is exclusive. Tool-call arguments are detached before execution, and Model clients receive
+frozen message/definition snapshots.
+
+MCP annotations are untrusted hints by specification. Consequently, MCP tools require approval and run
+exclusively by default, even when a server claims `readOnlyHint: true`. A host that trusts a configured
+server may opt in with `trustToolAnnotations: true`; only then does an explicitly read-only tool skip
+approval and default to parallel execution. Wire-provided `executionPolicy` values are ignored. Host-owned
+ordering overrides belong in the local `executionPolicyFor` option:
+
+```ts
+const provider = new MCPToolProvider(client, {
+  trustToolAnnotations: true, // Only for a server the host explicitly trusts.
+  executionPolicyFor: ({ name }) => name === "ordered_read" ? "exclusive" : undefined,
+});
+
+const tools = await provider.load({ signal });
+await provider.refresh({ signal });
+await provider.close();
+```
+
+An MCP result with `isError: true` becomes a typed `MCPToolCallError` rather than a successful tool result;
+JSON-RPC error envelopes become `MCPProtocolError`. `MCPToolProvider.close()` gates new execution and
+refreshes, drains admitted `listTools`/`callTool` requests, and then closes the client, so an acknowledged
+side effect is not discarded by premature transport shutdown. `loadMCPTools` remains a convenience for a
+single snapshot when the caller owns the client lifecycle.
 
 Cancellation is cooperative. Providers, MCP clients, and tools receive an `AbortSignal`, and the Runtime
 waits for started work to settle. Implementations must observe that signal when prompt shutdown matters.
@@ -181,8 +277,10 @@ src/agent-runtime.ts    protocol-neutral lifecycle and capability facade
 src/agent-loop.ts       orchestration and session serialization
 src/runtime/            model execution, retry, events, steering, tools
 src/provider/           provider adapters
+src/acp/                official-SDK ACP v1 adapter, permission bridge, update projector
 src/channel/            reusable channel adapters
 src/tools/              local tools
+src/mcp.ts              MCP tool policy, result normalization, refresh and lifecycle
 src/session*.ts         session contracts and stores
 examples/               minimal and HTTP runtime examples
 tests/                  runtime and integration tests
@@ -197,6 +295,7 @@ stacks belong in the production projects that embed this Runtime.
 An application belongs in this repository only when it has a clear Runtime-development responsibility,
 such as a future ACP protocol inspector. A generic chat UI or platform starter is not part of the Runtime.
 
-The next major protocol milestone is an ACP adapter with explicit session lifecycle, structured updates,
-cancellation, capability negotiation, and permission bridging. Checkpoint continuation for interrupted
-runs remains a runtime milestone.
+The stable ACP v1 adapter now establishes the intended client-to-agent boundary. Future protocol work may
+add session replay/load, more prompt content types, or ACP-managed MCP lifecycle only when their ownership
+and recovery policies are explicit. Checkpoint continuation for interrupted runs remains a Runtime
+milestone.

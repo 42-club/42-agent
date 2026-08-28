@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { estimateTokens, type ModelClient, type ToolCall } from "./model.js";
+import {
+  estimateTokens,
+  supportsModelStreaming,
+  type ModelClient,
+  type ToolCall,
+} from "./model.js";
 import { buildSystemPrompt } from "./prompt.js";
 import {
   EventDispatcher,
@@ -84,6 +89,11 @@ export class AgentLoop {
   /** Canonical Skill loader used to build prompts, when configured. */
   get skillLoader(): SkillLoader | undefined {
     return this.dependencies.skillLoader;
+  }
+
+  /** Whether the canonical ModelClient has a real streaming implementation. */
+  get supportsStreaming(): boolean {
+    return supportsModelStreaming(this.dependencies.model);
   }
 
   steer(sessionId: string, message: string): boolean {
