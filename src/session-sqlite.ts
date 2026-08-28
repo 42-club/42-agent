@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { dirname, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
-import type { Message, RunState, SaveSessionOptions, Session, SessionStore, ToolCallState } from "./session.js";
+import { SessionAlreadyExistsError, type Message, type RunState, type SaveSessionOptions, type Session, type SessionStore, type ToolCallState } from "./session.js";
 
 /** Durable, transactional store for a single SQLite database. */
 export class SqliteSessionStore implements SessionStore {
@@ -15,17 +15,11 @@ export class SqliteSessionStore implements SessionStore {
     this.migrate();
   }
 
-  async getOrCreate(sessionId: string): Promise<Session> {
+  async get(sessionId: string): Promise<Session | undefined> {
     const row = this.database.prepare(
       "SELECT id, version, metadata_json FROM sessions WHERE id = ?",
     ).get(sessionId) as { id: string; version: number; metadata_json: string } | undefined;
-    if (!row) {
-      const now = new Date().toISOString();
-      this.database.prepare(
-        "INSERT INTO sessions (id, version, metadata_json, created_at, updated_at) VALUES (?, 0, '{}', ?, ?)",
-      ).run(sessionId, now, now);
-      return { id: sessionId, version: 0, messages: [], metadata: {} };
-    }
+    if (!row) return undefined;
     const messages = this.database.prepare(
       `SELECT role, content, name, tool_call_id, metadata_json, created_at
        FROM messages WHERE session_id = ? ORDER BY sequence`,
@@ -48,6 +42,23 @@ export class SqliteSessionStore implements SessionStore {
       })),
       runState: run ? this.loadRun(run) : undefined,
     };
+  }
+
+  async create(sessionId: string, metadata: Record<string, unknown> = {}): Promise<Session> {
+    const now = new Date().toISOString();
+    try {
+      this.database.prepare(
+        "INSERT INTO sessions (id, version, metadata_json, created_at, updated_at) VALUES (?, 0, ?, ?, ?)",
+      ).run(sessionId, JSON.stringify(metadata), now, now);
+    } catch (error) {
+      if (/UNIQUE constraint failed/.test(String(error))) throw new SessionAlreadyExistsError(sessionId);
+      throw error;
+    }
+    return { id: sessionId, version: 0, messages: [], metadata };
+  }
+
+  async getOrCreate(sessionId: string): Promise<Session> {
+    return (await this.get(sessionId)) ?? this.create(sessionId);
   }
 
   async save(session: Session, options: SaveSessionOptions = {}): Promise<void> {
@@ -109,6 +120,11 @@ export class SqliteSessionStore implements SessionStore {
 
   close(): void {
     this.database.close();
+  }
+
+  async delete(sessionId: string): Promise<boolean> {
+    const result = this.database.prepare("DELETE FROM sessions WHERE id = ?").run(sessionId);
+    return Number(result.changes) > 0;
   }
 
   private saveRun(sessionId: string, run: RunState): void {

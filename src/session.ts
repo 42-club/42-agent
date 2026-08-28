@@ -41,8 +41,11 @@ export interface RunState {
 }
 
 export interface SessionStore {
+  get(sessionId: string): Promise<Session | undefined>;
+  create(sessionId: string, metadata?: Record<string, unknown>): Promise<Session>;
   getOrCreate(sessionId: string): Promise<Session>;
   save(session: Session, options?: SaveSessionOptions): Promise<void>;
+  delete(sessionId: string): Promise<boolean>;
 }
 
 export interface SaveSessionOptions {
@@ -53,11 +56,21 @@ export interface SaveSessionOptions {
 export class InMemorySessionStore implements SessionStore {
   private readonly sessions = new Map<string, Session>();
 
+  async get(sessionId: string): Promise<Session | undefined> {
+    return this.sessions.get(sessionId);
+  }
+
+  async create(sessionId: string, metadata: Record<string, unknown> = {}): Promise<Session> {
+    if (this.sessions.has(sessionId)) throw new SessionAlreadyExistsError(sessionId);
+    const session = { id: sessionId, version: 0, messages: [], metadata };
+    this.sessions.set(sessionId, session);
+    return session;
+  }
+
   async getOrCreate(sessionId: string): Promise<Session> {
     let session = this.sessions.get(sessionId);
     if (!session) {
-      session = { id: sessionId, version: 0, messages: [], metadata: {} };
-      this.sessions.set(sessionId, session);
+      session = await this.create(sessionId);
     }
     return session;
   }
@@ -65,6 +78,17 @@ export class InMemorySessionStore implements SessionStore {
   async save(session: Session, _options?: SaveSessionOptions): Promise<void> {
     session.version = (session.version ?? 0) + 1;
     this.sessions.set(session.id, session);
+  }
+
+  async delete(sessionId: string): Promise<boolean> {
+    return this.sessions.delete(sessionId);
+  }
+}
+
+export class SessionAlreadyExistsError extends Error {
+  constructor(sessionId: string) {
+    super(`Session already exists: ${sessionId}`);
+    this.name = "SessionAlreadyExistsError";
   }
 }
 

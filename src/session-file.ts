@@ -1,6 +1,6 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { SaveSessionOptions, Session, SessionStore } from "./session.js";
+import { SessionAlreadyExistsError, type SaveSessionOptions, type Session, type SessionStore } from "./session.js";
 
 /** Durable store for a single Runtime Service process. */
 export class FileSessionStore implements SessionStore {
@@ -11,7 +11,7 @@ export class FileSessionStore implements SessionStore {
     this.directory = resolve(directory);
   }
 
-  async getOrCreate(sessionId: string): Promise<Session> {
+  async get(sessionId: string): Promise<Session | undefined> {
     const cached = this.cache.get(sessionId);
     if (cached) return cached;
     await mkdir(this.directory, { recursive: true });
@@ -21,11 +21,20 @@ export class FileSessionStore implements SessionStore {
       this.cache.set(sessionId, session);
       return session;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      const session: Session = { id: sessionId, messages: [], metadata: {} };
-      this.cache.set(sessionId, session);
-      return session;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
     }
+  }
+
+  async create(sessionId: string, metadata: Record<string, unknown> = {}): Promise<Session> {
+    if (await this.get(sessionId)) throw new SessionAlreadyExistsError(sessionId);
+    const session: Session = { id: sessionId, version: 0, messages: [], metadata };
+    await this.save(session);
+    return session;
+  }
+
+  async getOrCreate(sessionId: string): Promise<Session> {
+    return (await this.get(sessionId)) ?? this.create(sessionId);
   }
 
   async save(session: Session, _options?: SaveSessionOptions): Promise<void> {
@@ -35,6 +44,17 @@ export class FileSessionStore implements SessionStore {
     await writeFile(temporary, JSON.stringify(session, null, 2), "utf8");
     await rename(temporary, path);
     this.cache.set(session.id, session);
+  }
+
+  async delete(sessionId: string): Promise<boolean> {
+    this.cache.delete(sessionId);
+    try {
+      await unlink(this.pathFor(sessionId));
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
   }
 
   private pathFor(sessionId: string): string {

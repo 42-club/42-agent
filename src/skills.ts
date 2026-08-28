@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 
 export interface LoadedSkill {
@@ -12,7 +12,16 @@ export interface SkillLoader {
   load(names: readonly string[]): Promise<readonly LoadedSkill[]>;
 }
 
-export class FileSystemSkillLoader implements SkillLoader {
+export interface SkillDescriptor {
+  name: string;
+  description: string;
+}
+
+export interface SkillCatalog extends SkillLoader {
+  list(): Promise<readonly SkillDescriptor[]>;
+}
+
+export class FileSystemSkillLoader implements SkillCatalog {
   private readonly root: string;
 
   constructor(root: string) {
@@ -21,6 +30,13 @@ export class FileSystemSkillLoader implements SkillLoader {
 
   async load(names: readonly string[]): Promise<readonly LoadedSkill[]> {
     return Promise.all(names.map((name) => this.loadOne(name)));
+  }
+
+  async list(): Promise<readonly SkillDescriptor[]> {
+    const entries = await readdir(this.root, { withFileTypes: true });
+    const names = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+    const loaded = await this.load(names);
+    return loaded.map(({ name, description }) => ({ name, description }));
   }
 
   private async loadOne(name: string): Promise<LoadedSkill> {

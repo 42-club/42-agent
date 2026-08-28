@@ -17,6 +17,10 @@ export interface Tool extends ToolDefinition {
   execute(arguments_: Record<string, unknown>, context: ToolContext): Promise<unknown>;
 }
 
+export interface ToolDescriptor extends ToolDefinition {
+  sessionAccess: "read" | "write";
+}
+
 export class ToolRegistry {
   private readonly tools = new Map<string, Tool>();
   private readonly validators = new Map<string, ValidateFunction>();
@@ -32,6 +36,15 @@ export class ToolRegistry {
     if (this.tools.has(tool.name)) throw new Error(`Tool already registered: ${tool.name}`);
     this.tools.set(tool.name, tool);
     this.validators.set(tool.name, this.ajv.compile(tool.inputSchema));
+  }
+
+  unregister(name: string): boolean {
+    this.validators.delete(name);
+    return this.tools.delete(name);
+  }
+
+  has(name: string): boolean {
+    return this.tools.has(name);
   }
 
   validate(name: string, input: unknown): asserts input is Record<string, unknown> {
@@ -55,12 +68,28 @@ export class ToolRegistry {
     return tool;
   }
 
-  definitions(): ToolDefinition[] {
-    return [...this.tools.values()].map(({ name, description, inputSchema }) => ({
+  definitions(names?: readonly string[]): ToolDefinition[] {
+    const selected = names ? names.map((name) => this.get(name)) : [...this.tools.values()];
+    return selected.map(({ name, description, inputSchema }) => ({
       name,
       description,
       inputSchema,
     }));
+  }
+
+  descriptors(): ToolDescriptor[] {
+    return [...this.tools.values()].map(({ name, description, inputSchema }) => ({
+      name,
+      description,
+      inputSchema,
+      sessionAccess: this.tools.get(name)?.sessionAccess ?? "read",
+    }));
+  }
+
+  select(names: readonly string[]): ToolRegistry {
+    const registry = new ToolRegistry();
+    for (const name of names) registry.register(this.get(name));
+    return registry;
   }
 }
 

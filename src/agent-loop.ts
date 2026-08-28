@@ -24,8 +24,16 @@ export interface RunTurnInput {
   userInput: string;
   promptInjections?: readonly string[];
   skills?: readonly string[];
+  tools?: readonly string[];
   signal?: AbortSignal;
   onEvent?: AgentLoopEventHandler;
+}
+
+export interface TurnExecutionResult {
+  sessionId: string;
+  runId: string;
+  content: string;
+  stopReason: "end_turn";
 }
 
 export interface RecoveryResult {
@@ -96,10 +104,14 @@ export class AgentLoop {
   }
 
   async runTurn(input: RunTurnInput): Promise<string> {
+    return (await this.runTurnDetailed(input)).content;
+  }
+
+  async runTurnDetailed(input: RunTurnInput): Promise<TurnExecutionResult> {
     return this.enqueueSession(input.sessionId, () => this.runTurnSerialized(input));
   }
 
-  private async runTurnSerialized(input: RunTurnInput): Promise<string> {
+  private async runTurnSerialized(input: RunTurnInput): Promise<TurnExecutionResult> {
     await this.recoverSession(input.sessionId);
     const session = await this.dependencies.sessionStore.getOrCreate(input.sessionId);
     const runState = createRunState();
@@ -110,8 +122,11 @@ export class AgentLoop {
       await input.onEvent?.(event);
     });
     const modelRunner = new ModelRunner(this.dependencies.model, this.retry);
+    const activeTools = input.tools
+      ? this.dependencies.tools.select(input.tools)
+      : this.dependencies.tools;
     const toolExecutor = new ToolExecutor(
-      this.dependencies.tools,
+      activeTools,
       this.dependencies.sessionStore,
       events,
     );
@@ -158,7 +173,7 @@ export class AgentLoop {
         const response = await modelRunner.run(
           {
             messages: session.messages,
-            tools: this.dependencies.tools.definitions(),
+            tools: activeTools.definitions(),
             systemPrompt,
             signal: input.signal,
           },
@@ -204,7 +219,12 @@ export class AgentLoop {
           runId: runState.id,
           content,
         });
-        return content;
+        return {
+          sessionId: session.id,
+          runId: runState.id,
+          content,
+          stopReason: "end_turn",
+        };
       }
       throw new Error("Agent exceeded maximum tool rounds");
     } catch (error) {
