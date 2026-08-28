@@ -127,13 +127,17 @@ src/provider/           Provider Adapter
 src/channel/            可复用的 Channel Adapter
 src/tools/              本地工具
 src/session*.ts         Session 契约和 Store
-apps/web/               可部署的浏览器 Client
 examples/               最小示例和 HTTP Runtime 示例
 tests/                  Runtime 与集成测试
 ```
 
 ## 后续方向
 
-可部署 Client 位于 `apps/`；可复用集成位于 `src/channel/`。下一个主要协议里程碑是 ACP Adapter，
-包括显式 Session 生命周期、结构化更新、取消、能力协商和权限桥接。中断运行的检查点续接仍是
-Runtime 层面的里程碑。
+本仓库只包含可复用 Runtime、协议 Adapter、聚焦的示例，以及一致性或集成测试。产品应用、
+部署特定 UI、认证、租户和托管技术栈属于嵌入本 Runtime 的上层生产项目。
+
+只有承担明确 Runtime 开发职责的应用才应进入本仓库，例如未来的 ACP 协议 Inspector。通用聊天
+UI 或平台 Starter 不属于 Runtime。
+
+下一个主要协议里程碑是 ACP Adapter，包括显式 Session 生命周期、结构化更新、取消、能力协商
+和权限桥接。中断运行的检查点续接仍是 Runtime 层面的里程碑。

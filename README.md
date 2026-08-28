@@ -133,14 +133,19 @@ src/provider/           provider adapters
 src/channel/            reusable channel adapters
 src/tools/              local tools
 src/session*.ts         session contracts and stores
-apps/web/               deployable browser client
 examples/               minimal and HTTP runtime examples
 tests/                  runtime and integration tests
 ```
 
 ## Direction
 
-Deployable clients live under `apps/`; reusable integrations remain under `src/channel/`. The next major
-protocol milestone is an ACP adapter with explicit session lifecycle, structured updates, cancellation,
-capability negotiation, and permission bridging. Checkpoint continuation for interrupted runs remains a
-runtime milestone.
+This repository contains the reusable Runtime, protocol adapters, focused examples, and conformance or
+integration tests. Product applications, deployment-specific UI, authentication, tenancy, and hosting
+stacks belong in the production projects that embed this Runtime.
+
+An application belongs in this repository only when it has a clear Runtime-development responsibility,
+such as a future ACP protocol inspector. A generic chat UI or platform starter is not part of the Runtime.
+
+The next major protocol milestone is an ACP adapter with explicit session lifecycle, structured updates,
+cancellation, capability negotiation, and permission bridging. Checkpoint continuation for interrupted
+runs remains a runtime milestone.

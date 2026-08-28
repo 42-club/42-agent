@@ -60,8 +60,10 @@ protocol-level conformance tests for the supported version and capabilities.
 - `skills.ts` supplies optional instructions; skills do not own tools, permissions, sessions, or transports.
 - `mcp.ts` adapts MCP tools to the local Tool interface. MCP supplies agent capabilities; ACP exposes and
   controls an agent from its client. Keep these responsibilities distinct.
-- `apps/` contains deployable clients or demonstrations. Reusable runtime and protocol code belongs under
-  `src/`.
+- Product applications, generic chat UIs, authentication, tenancy, and hosting stacks belong to the
+  production projects that embed this Runtime, not this repository.
+- Add an application to this repository only when it has a focused Runtime-development responsibility,
+  such as protocol inspection or conformance testing. Keep reusable runtime and protocol code under `src/`.
 
 ## Concurrency and durability
 
