@@ -1,24 +1,39 @@
 import Ajv2020, { type ValidateFunction } from "ajv/dist/2020.js";
 import type { ToolDefinition } from "../model.js";
-import type { Session } from "../session.js";
+import type { ReadonlySession, Session } from "../session.js";
 
 export type ApprovalHandler = (question: string) => Promise<boolean>;
 
 export interface ToolContext {
-  readonly session: Session;
+  /** Deeply immutable snapshot. It never aliases the Runtime's live Session. */
+  readonly session: ReadonlySession;
   /** Present only for tools explicitly registered with sessionAccess: "write". */
-  mutableSession?: Session;
+  readonly mutableSession?: Session;
+  readonly requestApproval: ApprovalHandler;
+  readonly signal?: AbortSignal;
+}
+
+/** Mutable execution state kept inside AgentLoop and never passed directly to a Tool. */
+export interface ToolExecutionContext {
+  session: Session;
   requestApproval: ApprovalHandler;
   signal?: AbortSignal;
 }
 
 export interface Tool extends ToolDefinition {
+  /**
+   * Write access is trusted, executes as an exclusive barrier, and checkpoints
+   * the complete message history because existing messages may have changed.
+   */
   sessionAccess?: "read" | "write";
+  /** Use exclusive for capabilities whose external effects must not overlap or reorder. */
+  executionPolicy?: "parallel" | "exclusive";
   execute(arguments_: Record<string, unknown>, context: ToolContext): Promise<unknown>;
 }
 
 export interface ToolDescriptor extends ToolDefinition {
   sessionAccess: "read" | "write";
+  executionPolicy: "parallel" | "exclusive";
 }
 
 export class ToolRegistry {
@@ -56,10 +71,13 @@ export class ToolRegistry {
     }
   }
 
-  contextFor(tool: Tool, context: ToolContext): ToolContext {
-    return tool.sessionAccess === "write"
-      ? { ...context, mutableSession: context.session as Session }
-      : { ...context, mutableSession: undefined };
+  contextFor(tool: Tool, context: ToolExecutionContext): ToolContext {
+    return {
+      session: immutableSessionSnapshot(context.session),
+      requestApproval: context.requestApproval,
+      signal: context.signal,
+      mutableSession: tool.sessionAccess === "write" ? context.session : undefined,
+    };
   }
 
   get(name: string): Tool {
@@ -83,6 +101,7 @@ export class ToolRegistry {
       description,
       inputSchema,
       sessionAccess: this.tools.get(name)?.sessionAccess ?? "read",
+      executionPolicy: this.effectiveExecutionPolicy(this.get(name)),
     }));
   }
 
@@ -91,6 +110,24 @@ export class ToolRegistry {
     for (const name of names) registry.register(this.get(name));
     return registry;
   }
+
+  effectiveExecutionPolicy(tool: Tool): "parallel" | "exclusive" {
+    return tool.sessionAccess === "write" ? "exclusive" : tool.executionPolicy ?? "parallel";
+  }
+}
+
+function immutableSessionSnapshot(session: Session): ReadonlySession {
+  return deepFreeze(structuredClone(session)) as ReadonlySession;
+}
+
+function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value)) return value;
+  seen.add(value);
+  for (const key of Reflect.ownKeys(value)) {
+    deepFreeze((value as Record<PropertyKey, unknown>)[key], seen);
+  }
+  return Object.freeze(value);
 }
 
 export class InvalidToolInputError extends Error {

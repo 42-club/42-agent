@@ -9,6 +9,7 @@ import {
   type ModelRequest,
   type ModelResponse,
   type ModelStreamEvent,
+  RetryPolicy,
   ToolRegistry,
   createMessage,
 } from "../src/index.js";
@@ -66,6 +67,37 @@ test("retries transient model failures", async () => {
   assert.equal(attempts, 3);
 });
 
+test("cancellation raised by a retry observer skips an already-aborted backoff", async () => {
+  const controller = new AbortController();
+  const retry = new RetryPolicy({
+    maxAttempts: 3,
+    baseDelayMs: 100,
+    shouldRetry: () => true,
+  });
+  let attempts = 0;
+  let settled = false;
+  const outcome = retry.execute(
+    async () => {
+      attempts += 1;
+      throw new Error("retryable");
+    },
+    controller.signal,
+    () => controller.abort(new DOMException("stop retry", "AbortError")),
+  ).then(
+    () => ({ resolved: true as const, error: undefined }),
+    (error: unknown) => ({ resolved: false as const, error }),
+  ).finally(() => {
+    settled = true;
+  });
+
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(settled, true);
+  const result = await outcome;
+  assert.equal(result.resolved, false);
+  assert.equal((result.error as Error).name, "AbortError");
+  assert.equal(attempts, 1);
+});
+
 test("applies steering at the next loop barrier", async () => {
   let calls = 0;
   let releaseFirst!: () => void;
@@ -95,8 +127,11 @@ test("applies steering at the next loop barrier", async () => {
 
 test("cancellation is persisted", async () => {
   const controller = new AbortController();
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
   const model: ModelClient = {
     async complete(request) {
+      markStarted();
       return new Promise((_resolve, reject) => {
         request.signal?.addEventListener("abort", () => reject(request.signal?.reason), {
           once: true,
@@ -110,9 +145,37 @@ test("cancellation is persisted", async () => {
     userInput: "go",
     signal: controller.signal,
   });
+  await started;
   controller.abort(new DOMException("stop", "AbortError"));
   await assert.rejects(running);
   assert.equal((await store.getOrCreate("cancel")).runState?.status, "cancelled");
+});
+
+test("observer failures cannot corrupt canonical run completion", async () => {
+  for (const eventType of ["run_started", "run_completed"] as const) {
+    const store = new InMemorySessionStore();
+    const model: ModelClient = { async complete() { return { content: "done" }; } };
+    const tools = new ToolRegistry();
+    tools.register(new ConversationCompressionTool(model));
+    const loop = new AgentLoop({
+      model,
+      tools,
+      sessionStore: store,
+      requestApproval: async () => true,
+      onEvent(event) {
+        if (event.type === eventType) throw new Error("observer disconnected");
+      },
+    });
+
+    assert.equal(
+      await loop.runTurn({ sessionId: `observer-${eventType}`, userInput: "go" }),
+      "done",
+    );
+    assert.equal(
+      (await store.get(`observer-${eventType}`))?.runState?.status,
+      "completed",
+    );
+  }
 });
 
 test("recovers interrupted tool calls without replaying them", async () => {
@@ -139,6 +202,65 @@ test("recovers interrupted tool calls without replaying them", async () => {
   assert.deepEqual(result, { recovered: true, interruptedToolCalls: 1 });
   assert.equal(session.runState.status, "interrupted");
   assert.match(session.messages.at(-1)?.content ?? "", /InterruptedToolCall/);
+});
+
+test("recovery materializes every durable tool outcome into model-visible messages", async () => {
+  const store = new InMemorySessionStore();
+  const session = await store.getOrCreate("recover-batch");
+  session.messages.push(
+    createMessage({
+      role: "assistant",
+      content: "",
+      metadata: { toolCalls: [{ id: "previous", name: "side_effect", arguments: {} }] },
+    }),
+    createMessage({
+      role: "tool",
+      name: "side_effect",
+      toolCallId: "previous",
+      content: JSON.stringify({ prior: true }),
+    }),
+  );
+  session.messages.push(
+    createMessage({
+      role: "assistant",
+      content: "",
+      metadata: {
+        toolCalls: [
+          { id: "completed", name: "side_effect", arguments: {} },
+          { id: "failed", name: "side_effect", arguments: {} },
+          { id: "running", name: "side_effect", arguments: {} },
+        ],
+      },
+    }),
+  );
+  const timestamp = new Date().toISOString();
+  session.runState = {
+    id: "old-batch",
+    status: "running",
+    phase: "tools",
+    round: 0,
+    startedAt: timestamp,
+    updatedAt: timestamp,
+    toolCalls: [
+      { id: "previous", name: "side_effect", arguments: {}, status: "completed", result: { prior: true } },
+      { id: "completed", name: "side_effect", arguments: {}, status: "completed", result: { ok: true } },
+      { id: "failed", name: "side_effect", arguments: {}, status: "failed", error: "boom" },
+      { id: "running", name: "side_effect", arguments: {}, status: "running" },
+    ],
+  };
+
+  const loop = createLoop({ async complete() { return { content: "ok" }; } }, store);
+  assert.deepEqual(await loop.recoverSession("recover-batch"), {
+    recovered: true,
+    interruptedToolCalls: 1,
+  });
+  const toolMessages = session.messages.filter((message) => message.role === "tool");
+  assert.deepEqual(toolMessages.map((message) => message.toolCallId), [
+    "previous", "completed", "failed", "running",
+  ]);
+  assert.deepEqual(JSON.parse(toolMessages[1]!.content), { ok: true });
+  assert.match(toolMessages[2]!.content, /ToolExecutionError/);
+  assert.match(toolMessages[3]!.content, /InterruptedToolCall/);
 });
 
 test("provider adapter isolates provider message formats", async () => {

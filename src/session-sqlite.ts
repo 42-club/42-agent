@@ -1,11 +1,12 @@
 import { DatabaseSync } from "node:sqlite";
 import { dirname, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
-import { SessionAlreadyExistsError, type Message, type RunState, type SaveSessionOptions, type Session, type SessionStore, type ToolCallState } from "./session.js";
+import { assertValidSessionId, MessageHistoryRewriteRequiredError, SessionAlreadyExistsError, SessionVersionConflictError, type Message, type RunState, type SaveSessionOptions, type Session, type SessionStore, type ToolCallState } from "./session.js";
 
 /** Durable, transactional store for a single SQLite database. */
 export class SqliteSessionStore implements SessionStore {
   private readonly database: DatabaseSync;
+  private readonly messageSnapshots = new WeakMap<Session, MessageSnapshot>();
 
   constructor(filename: string) {
     const path = resolve(filename);
@@ -16,35 +17,34 @@ export class SqliteSessionStore implements SessionStore {
   }
 
   async get(sessionId: string): Promise<Session | undefined> {
+    assertValidSessionId(sessionId);
     const row = this.database.prepare(
-      "SELECT id, version, metadata_json FROM sessions WHERE id = ?",
-    ).get(sessionId) as { id: string; version: number; metadata_json: string } | undefined;
+      "SELECT id, version, metadata_json, current_run_id FROM sessions WHERE id = ?",
+    ).get(sessionId) as {
+      id: string;
+      version: number;
+      metadata_json: string;
+      current_run_id: string | null;
+    } | undefined;
     if (!row) return undefined;
-    const messages = this.database.prepare(
-      `SELECT role, content, name, tool_call_id, metadata_json, created_at
-       FROM messages WHERE session_id = ? ORDER BY sequence`,
-    ).all(sessionId) as Array<Record<string, unknown>>;
+    const messages = this.loadMessages(sessionId);
     const run = this.database.prepare(
       `SELECT id, status, phase, round, error, started_at, updated_at
-       FROM runs WHERE session_id = ? ORDER BY started_at DESC LIMIT 1`,
-    ).get(sessionId) as Record<string, unknown> | undefined;
-    return {
+       FROM runs WHERE session_id = ? AND id = ?`,
+    ).get(sessionId, row.current_run_id) as Record<string, unknown> | undefined;
+    const session: Session = {
       id: row.id,
       version: Number(row.version),
       metadata: JSON.parse(row.metadata_json),
-      messages: messages.map((message) => ({
-        role: message.role as Message["role"],
-        content: String(message.content),
-        name: nullableString(message.name),
-        toolCallId: nullableString(message.tool_call_id),
-        metadata: message.metadata_json ? JSON.parse(String(message.metadata_json)) : undefined,
-        createdAt: nullableString(message.created_at),
-      })),
+      messages,
       runState: run ? this.loadRun(run) : undefined,
     };
+    this.messageSnapshots.set(session, snapshotMessages(messages));
+    return session;
   }
 
   async create(sessionId: string, metadata: Record<string, unknown> = {}): Promise<Session> {
+    assertValidSessionId(sessionId);
     const now = new Date().toISOString();
     try {
       this.database.prepare(
@@ -54,14 +54,27 @@ export class SqliteSessionStore implements SessionStore {
       if (/UNIQUE constraint failed/.test(String(error))) throw new SessionAlreadyExistsError(sessionId);
       throw error;
     }
-    return { id: sessionId, version: 0, messages: [], metadata };
+    const session: Session = { id: sessionId, version: 0, messages: [], metadata };
+    this.messageSnapshots.set(session, snapshotMessages([]));
+    return session;
   }
 
   async getOrCreate(sessionId: string): Promise<Session> {
-    return (await this.get(sessionId)) ?? this.create(sessionId);
+    assertValidSessionId(sessionId);
+    const existing = await this.get(sessionId);
+    if (existing) return existing;
+    try {
+      return await this.create(sessionId);
+    } catch (error) {
+      if (!(error instanceof SessionAlreadyExistsError)) throw error;
+      const created = await this.get(sessionId);
+      if (created) return created;
+      throw error;
+    }
   }
 
   async save(session: Session, options: SaveSessionOptions = {}): Promise<void> {
+    assertValidSessionId(session.id);
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const existing = this.database.prepare("SELECT version FROM sessions WHERE id = ?").get(
@@ -69,18 +82,22 @@ export class SqliteSessionStore implements SessionStore {
       ) as { version: number } | undefined;
       const expected = session.version ?? 0;
       if (!existing) {
-        const now = new Date().toISOString();
-        this.database.prepare(
-          "INSERT INTO sessions (id, version, metadata_json, created_at, updated_at) VALUES (?, 0, ?, ?, ?)",
-        ).run(session.id, JSON.stringify(session.metadata), now, now);
+        throw new SessionVersionConflictError(session.id, expected, -1);
       } else if (Number(existing.version) !== expected) {
         throw new SessionVersionConflictError(session.id, expected, Number(existing.version));
       }
       const nextVersion = expected + 1;
       const updated = this.database.prepare(
-        `UPDATE sessions SET version = ?, metadata_json = ?, updated_at = ?
+        `UPDATE sessions SET version = ?, metadata_json = ?, current_run_id = ?, updated_at = ?
          WHERE id = ? AND version = ?`,
-      ).run(nextVersion, JSON.stringify(session.metadata), new Date().toISOString(), session.id, expected);
+      ).run(
+        nextVersion,
+        JSON.stringify(session.metadata),
+        session.runState?.id ?? null,
+        new Date().toISOString(),
+        session.id,
+        expected,
+      );
       if (Number(updated.changes) !== 1) {
         const actual = this.database.prepare("SELECT version FROM sessions WHERE id = ?")
           .get(session.id) as { version: number } | undefined;
@@ -91,10 +108,12 @@ export class SqliteSessionStore implements SessionStore {
         this.database.prepare("DELETE FROM messages WHERE session_id = ?").run(session.id);
       }
       const persistedCount = options.rewriteMessages ? 0 : this.persistedMessageCount(session.id);
-      if (persistedCount > session.messages.length) {
-        throw new Error(
-          `Session ${session.id} message history was shortened without rewriteMessages`,
-        );
+      if (!options.rewriteMessages) {
+        const known = this.messageSnapshots.get(session);
+        const snapshot = known?.count === persistedCount
+          ? known
+          : snapshotMessages(this.loadMessages(session.id));
+        assertAppendOnlySnapshot(session.id, snapshot, session.messages);
       }
       const insertMessage = this.database.prepare(
         `INSERT INTO messages
@@ -112,6 +131,13 @@ export class SqliteSessionStore implements SessionStore {
       if (session.runState) this.saveRun(session.id, session.runState);
       this.database.exec("COMMIT");
       session.version = nextVersion;
+      const previous = this.messageSnapshots.get(session);
+      this.messageSnapshots.set(
+        session,
+        !options.rewriteMessages && previous?.count === persistedCount
+          ? appendMessageSnapshot(previous, session.messages)
+          : snapshotMessages(session.messages),
+      );
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
@@ -123,6 +149,7 @@ export class SqliteSessionStore implements SessionStore {
   }
 
   async delete(sessionId: string): Promise<boolean> {
+    assertValidSessionId(sessionId);
     const result = this.database.prepare("DELETE FROM sessions WHERE id = ?").run(sessionId);
     return Number(result.changes) > 0;
   }
@@ -163,6 +190,21 @@ export class SqliteSessionStore implements SessionStore {
     return Number(row.count);
   }
 
+  private loadMessages(sessionId: string): Message[] {
+    const messages = this.database.prepare(
+      `SELECT role, content, name, tool_call_id, metadata_json, created_at
+       FROM messages WHERE session_id = ? ORDER BY sequence`,
+    ).all(sessionId) as Array<Record<string, unknown>>;
+    return messages.map((message) => ({
+      role: message.role as Message["role"],
+      content: String(message.content),
+      name: nullableString(message.name),
+      toolCallId: nullableString(message.tool_call_id),
+      metadata: message.metadata_json ? JSON.parse(String(message.metadata_json)) : undefined,
+      createdAt: nullableString(message.created_at),
+    }));
+  }
+
   private loadRun(row: Record<string, unknown>): RunState {
     const calls = this.database.prepare(
       `SELECT id, name, arguments_json, status, result_json, error
@@ -188,7 +230,7 @@ export class SqliteSessionStore implements SessionStore {
       CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY, version INTEGER NOT NULL, metadata_json TEXT NOT NULL,
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, current_run_id TEXT
       );
       CREATE TABLE IF NOT EXISTS messages (
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -210,16 +252,60 @@ export class SqliteSessionStore implements SessionStore {
       );
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, CURRENT_TIMESTAMP);
     `);
-  }
-}
-
-export class SessionVersionConflictError extends Error {
-  constructor(sessionId: string, expected: number, actual: number) {
-    super(`Session ${sessionId} version conflict: expected ${expected}, found ${actual}`);
-    this.name = "SessionVersionConflictError";
+    const sessionColumns = this.database.prepare("PRAGMA table_info(sessions)").all() as Array<{
+      name: string;
+    }>;
+    if (!sessionColumns.some((column) => column.name === "current_run_id")) {
+      this.database.exec("ALTER TABLE sessions ADD COLUMN current_run_id TEXT");
+    }
+    this.database.exec(`
+      UPDATE sessions
+      SET current_run_id = (
+        SELECT id FROM runs
+        WHERE runs.session_id = sessions.id
+        ORDER BY started_at DESC, rowid DESC
+        LIMIT 1
+      )
+      WHERE current_run_id IS NULL;
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, CURRENT_TIMESTAMP);
+    `);
   }
 }
 
 function nullableString(value: unknown): string | undefined {
   return value == null ? undefined : String(value);
+}
+
+interface MessageSnapshot {
+  count: number;
+  json: string;
+}
+
+function snapshotMessages(messages: readonly Message[]): MessageSnapshot {
+  return { count: messages.length, json: JSON.stringify(messages) };
+}
+
+function assertAppendOnlySnapshot(
+  sessionId: string,
+  snapshot: MessageSnapshot,
+  messages: readonly Message[],
+): void {
+  if (snapshot.count > messages.length
+    || JSON.stringify(messages.slice(0, snapshot.count)) !== snapshot.json) {
+    throw new MessageHistoryRewriteRequiredError(sessionId);
+  }
+}
+
+function appendMessageSnapshot(
+  snapshot: MessageSnapshot,
+  messages: readonly Message[],
+): MessageSnapshot {
+  if (messages.length === snapshot.count) return snapshot;
+  const appended = JSON.stringify(messages.slice(snapshot.count));
+  return {
+    count: messages.length,
+    json: snapshot.count === 0
+      ? appended
+      : `${snapshot.json.slice(0, -1)},${appended.slice(1)}`,
+  };
 }

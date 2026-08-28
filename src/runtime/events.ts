@@ -19,7 +19,29 @@ export type AgentLoopEventHandler = (event: AgentLoopEvent) => void | Promise<vo
 export class EventDispatcher {
   constructor(private readonly handler?: AgentLoopEventHandler) {}
 
-  async emit(event: AgentLoopEvent): Promise<void> {
-    await this.handler?.(event);
+  emit(event: AgentLoopEvent): void {
+    if (!this.handler) return;
+    let snapshot: AgentLoopEvent;
+    try {
+      snapshot = deepFreeze(structuredClone(event));
+    } catch {
+      // Projection data must never become part of the canonical state machine.
+      return;
+    }
+    try {
+      void Promise.resolve(this.handler(snapshot)).catch(() => undefined);
+    } catch {
+      // Observers are detached, best-effort projections.
+    }
   }
+}
+
+function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value)) return value;
+  seen.add(value);
+  for (const key of Reflect.ownKeys(value)) {
+    deepFreeze((value as Record<PropertyKey, unknown>)[key], seen);
+  }
+  return Object.freeze(value);
 }

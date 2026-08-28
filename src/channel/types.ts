@@ -16,7 +16,8 @@ export interface ChannelOutboundMessage {
 
 /**
  * A channel only translates transport-specific events and output. It must not
- * keep conversation history; AgentLoop's SessionStore is the source of truth.
+ * keep conversation history; AgentRuntime owns lifecycle and AgentLoop's
+ * SessionStore is the source of truth.
  */
 export interface ChannelAdapter<RawEvent = unknown> {
   readonly name: string;

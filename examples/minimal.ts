@@ -1,5 +1,10 @@
-import { AgentLoop, InMemorySessionStore, type ModelClient, ToolRegistry } from "../src/index.js";
-import { BashTool, ConversationCompressionTool } from "../src/index.js";
+import {
+  AgentLoop,
+  AgentRuntime,
+  InMemorySessionStore,
+  type ModelClient,
+  ToolRegistry,
+} from "../src/index.js";
 
 const model: ModelClient = {
   async complete({ messages }) {
@@ -8,14 +13,19 @@ const model: ModelClient = {
 };
 
 const tools = new ToolRegistry();
-tools.register(new ConversationCompressionTool(model));
-tools.register(new BashTool({ defaultCwd: process.cwd() }));
+const sessionStore = new InMemorySessionStore();
 
 const loop = new AgentLoop({
   model,
   tools,
-  sessionStore: new InMemorySessionStore(),
+  sessionStore,
   requestApproval: async () => false,
 });
+const runtime = new AgentRuntime({ loop });
 
-console.log(await loop.runTurn({ sessionId: "demo", userInput: "你好" }));
+await runtime.createSession({ sessionId: "demo" });
+const result = await runtime.prompt({
+  sessionId: "demo",
+  content: [{ type: "text", text: "你好" }],
+});
+console.log(result.content.map((part) => part.text).join(""));

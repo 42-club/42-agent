@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   AgentLoop,
+  AgentRuntime,
   ChannelRuntime,
   ConversationCompressionTool,
   InMemorySessionStore,
@@ -40,7 +41,7 @@ class TestChannel implements ChannelAdapter<TestEvent> {
   }
 }
 
-test("channel stays stateless and delegates history to AgentLoop", async () => {
+test("channel stays stateless and delegates lifecycle to AgentRuntime", async () => {
   const model: ModelClient = {
     async complete({ messages, systemPrompt }) {
       assert.match(systemPrompt, /测试 Channel/);
@@ -57,7 +58,8 @@ test("channel stays stateless and delegates history to AgentLoop", async () => {
     requestApproval: async () => false,
   });
   const channel = new TestChannel();
-  const runtime = new ChannelRuntime(loop, channel);
+  const agentRuntime = new AgentRuntime({ loop, sessionStore: sessions, tools });
+  const runtime = new ChannelRuntime(agentRuntime, channel);
 
   await runtime.handle({ conversation: "c1", sender: "u1", text: "first" });
   await runtime.handle({ conversation: "c1", sender: "u1", text: "second" });

@@ -1,11 +1,32 @@
 {
   "name": "42-agent",
   "version": "0.1.0",
+  "description": "Protocol-neutral single-process runtime for production AI agents",
   "private": true,
   "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/src",
+    "dist/examples",
+    "README.md",
+    "README.zh-CN.md",
+    "ARCHITECTURE.md"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/tests/*.test.js",
+    "prepack": "npm run build",
     "example": "npm run build && node dist/examples/minimal.js",
     "runtime": "npm run build && node dist/examples/runtime-server.js",
     "cli": "npm run build && node dist/src/channel/cli/main.js"
@@ -19,5 +40,9 @@
     "ai": "^7.0.70",
     "ajv": "^8.20.0",
     "zod": "^4.4.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/42-club/42-agent.git"
   }
 }

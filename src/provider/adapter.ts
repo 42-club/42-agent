@@ -23,6 +23,8 @@ export interface ProviderTransport<ProviderRequest, ProviderResponse, ProviderSt
 export class AdaptedModelClient<ProviderRequest, ProviderResponse, ProviderStreamEvent>
   implements ModelClient
 {
+  readonly stream?: (request: ModelRequest) => AsyncIterable<ModelStreamEvent>;
+
   constructor(
     private readonly transport: ProviderTransport<
       ProviderRequest,
@@ -30,7 +32,15 @@ export class AdaptedModelClient<ProviderRequest, ProviderResponse, ProviderStrea
       ProviderStreamEvent
     >,
     private readonly codec: ProviderCodec<ProviderRequest, ProviderResponse, ProviderStreamEvent>,
-  ) {}
+  ) {
+    // Keep `stream` genuinely optional. ModelRunner uses its presence to decide
+    // whether a call is streaming and therefore whether transparent retries are
+    // safe. Installing a fallback stream for a non-streaming transport silently
+    // disabled the normal RetryPolicy.
+    if (transport.stream) {
+      this.stream = (request) => this.streamTransport(request);
+    }
+  }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     const response = await this.transport.complete(
@@ -40,12 +50,10 @@ export class AdaptedModelClient<ProviderRequest, ProviderResponse, ProviderStrea
     return this.codec.fromProviderResponse(response);
   }
 
-  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
-    if (!this.transport.stream) {
-      yield { type: "done", response: await this.complete(request) };
-      return;
-    }
-    for await (const event of this.transport.stream(
+  private async *streamTransport(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    const stream = this.transport.stream;
+    if (!stream) return;
+    for await (const event of stream.call(this.transport,
       this.codec.toProviderRequest(request),
       request.signal,
     )) {

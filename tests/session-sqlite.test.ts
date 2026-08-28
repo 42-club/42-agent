@@ -39,6 +39,24 @@ test("SQLite persists messages, runs, and tool calls across store instances", as
   }
 });
 
+test("SQLite getOrCreate converges when two store instances race", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "42-agent-sqlite-create-race-"));
+  const filename = join(directory, "runtime.sqlite");
+  const first = new SqliteSessionStore(filename);
+  const second = new SqliteSessionStore(filename);
+  try {
+    const sessions = await Promise.all([
+      first.getOrCreate("shared"),
+      second.getOrCreate("shared"),
+    ]);
+    assert.deepEqual(sessions.map((session) => session.id), ["shared", "shared"]);
+  } finally {
+    first.close();
+    second.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("SQLite appends messages and upserts tool calls without rewriting persisted rows", async () => {
   const directory = await mkdtemp(join(tmpdir(), "42-agent-sqlite-incremental-"));
   const filename = join(directory, "runtime.sqlite");
@@ -94,7 +112,7 @@ test("SQLite rewrites message history only when explicitly requested", async () 
     await store.save(session);
 
     session.messages = [createMessage({ role: "system", content: "summary" })];
-    await assert.rejects(store.save(session), /shortened without rewriteMessages/);
+    await assert.rejects(store.save(session), { name: "MessageHistoryRewriteRequiredError" });
     await store.save(session, { rewriteMessages: true });
     store.close();
 
@@ -103,6 +121,101 @@ test("SQLite rewrites message history only when explicitly requested", async () 
     assert.deepEqual(restored.messages.map((message) => message.content), ["summary"]);
     restoredStore.close();
   } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("SQLite requires rewriteMessages for existing message edits", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "42-agent-sqlite-edit-"));
+  const filename = join(directory, "runtime.sqlite");
+  const store = new SqliteSessionStore(filename);
+  try {
+    const session = await store.create("edit");
+    session.messages.push(createMessage({ role: "user", content: "original" }));
+    await store.save(session);
+    session.messages[0]!.content = "edited";
+
+    await assert.rejects(store.save(session), { name: "MessageHistoryRewriteRequiredError" });
+    await store.save(session, { rewriteMessages: true });
+
+    const reopened = new SqliteSessionStore(filename);
+    try {
+      assert.equal((await reopened.get(session.id))?.messages[0]?.content, "edited");
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("SQLite rejects late saves after deletion", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "42-agent-sqlite-delete-"));
+  const filename = join(directory, "runtime.sqlite");
+  try {
+    const store = new SqliteSessionStore(filename);
+    const session = await store.create("deleted");
+    assert.equal(await store.delete(session.id), true);
+    session.messages.push(createMessage({ role: "user", content: "late" }));
+    await assert.rejects(store.save(session), { name: "SessionVersionConflictError" });
+    assert.equal(await store.get(session.id), undefined);
+    store.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("SQLite restores the explicitly current run when timestamps tie", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-sqlite-current-run-"));
+  const filename = join(directory, "sessions.sqlite");
+  const timestamp = new Date().toISOString();
+  const store = new SqliteSessionStore(filename);
+  try {
+    const session = await store.create("same-timestamp");
+    session.runState = {
+      id: "older-run",
+      status: "completed",
+      phase: "idle",
+      round: 0,
+      startedAt: timestamp,
+      updatedAt: timestamp,
+      toolCalls: [],
+    };
+    await store.save(session);
+    session.runState = {
+      id: "current-run",
+      status: "running",
+      phase: "tools",
+      round: 1,
+      startedAt: timestamp,
+      updatedAt: timestamp,
+      toolCalls: [],
+    };
+    await store.save(session);
+  } finally {
+    store.close();
+  }
+
+  const reopened = new SqliteSessionStore(filename);
+  try {
+    assert.equal((await reopened.get("same-timestamp"))?.runState?.id, "current-run");
+    assert.equal((await reopened.get("same-timestamp"))?.runState?.status, "running");
+  } finally {
+    reopened.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("SQLite rejects non-well-formed Unicode session IDs", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-sqlite-session-id-"));
+  const store = new SqliteSessionStore(join(directory, "sessions.sqlite"));
+  try {
+    await assert.rejects(store.create("\ud800"), { name: "InvalidSessionIdError" });
+    await assert.rejects(store.get("\ud801"), { name: "InvalidSessionIdError" });
+    assert.ok(await store.create("\ufffd"));
+  } finally {
+    store.close();
     await rm(directory, { recursive: true, force: true });
   }
 });

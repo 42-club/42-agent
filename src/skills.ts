@@ -1,5 +1,5 @@
-import { readdir, readFile } from "node:fs/promises";
-import { resolve, sep } from "node:path";
+import { readdir, readFile, realpath } from "node:fs/promises";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 
 export interface LoadedSkill {
   name: string;
@@ -29,28 +29,49 @@ export class FileSystemSkillLoader implements SkillCatalog {
   }
 
   async load(names: readonly string[]): Promise<readonly LoadedSkill[]> {
-    return Promise.all(names.map((name) => this.loadOne(name)));
+    const root = await realpath(this.root);
+    return Promise.all(names.map((name) => this.loadOne(name, root)));
   }
 
   async list(): Promise<readonly SkillDescriptor[]> {
-    const entries = await readdir(this.root, { withFileTypes: true });
+    const root = await realpath(this.root);
+    const entries = await readdir(root, { withFileTypes: true });
     const names = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
-    const loaded = await this.load(names);
+    const loaded = await Promise.all(names.map((name) => this.loadOne(name, root)));
     return loaded.map(({ name, description }) => ({ name, description }));
   }
 
-  private async loadOne(name: string): Promise<LoadedSkill> {
+  private async loadOne(name: string, root: string): Promise<LoadedSkill> {
     const path = resolve(this.root, name, "SKILL.md");
-    if (!path.startsWith(`${this.root}${sep}`)) throw new Error("Skill path escapes configured root");
-    const raw = await readFile(path, "utf8");
+    const directory = resolve(this.root, name);
+    assertWithinRoot(this.root, directory);
+
+    const realDirectory = await realpath(directory);
+    assertWithinRoot(root, realDirectory);
+
+    const realSkillPath = await realpath(resolve(realDirectory, "SKILL.md"));
+    assertWithinRoot(root, realSkillPath);
+
+    const raw = await readFile(realSkillPath, "utf8");
     const { metadata, instructions } = parseSkill(raw);
+    if (metadata.name !== undefined && metadata.name !== name) {
+      throw new Error(`Skill metadata name must match its directory: ${name}`);
+    }
     return {
-      name: metadata.name ?? name,
+      name,
       description: metadata.description ?? "",
       instructions,
       path,
     };
   }
+}
+
+function assertWithinRoot(root: string, target: string): void {
+  const child = relative(root, target);
+  if (child === "" || (!isAbsolute(child) && child !== ".." && !child.startsWith(`..${sep}`))) {
+    return;
+  }
+  throw new Error("Skill path escapes configured root");
 }
 
 function parseSkill(raw: string): {

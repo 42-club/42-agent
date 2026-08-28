@@ -48,15 +48,27 @@ export function throwIfAborted(signal?: AbortSignal): void {
 }
 
 function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, delayMs);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
-      },
-      { once: true },
-    );
+    let settled = false;
+    const cleanup = () => signal?.removeEventListener("abort", aborted);
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const aborted = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanup();
+      reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    const timer = setTimeout(finish, delayMs);
+    signal?.addEventListener("abort", aborted, { once: true });
+    // Do not miss an abort raised by a synchronous retry observer before this
+    // delay was created, or one racing listener registration.
+    if (signal?.aborted) aborted();
   });
 }

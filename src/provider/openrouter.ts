@@ -66,30 +66,51 @@ export class OpenRouterModelClient implements ModelClient {
     const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
     const toolCalls = new Map<number, { id: string; name: string; arguments: string }>();
     let buffer = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      buffer += value ?? "";
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-        const data = trimmed.slice(5).trim();
-        if (!data || data === "[DONE]") continue;
-        const chunk = JSON.parse(data);
-        if (chunk.error) throw new Error(chunk.error.message ?? "OpenRouter stream failed");
-        const delta = chunk.choices?.[0]?.delta;
-        if (delta?.content) yield { type: "text_delta", delta: delta.content };
-        for (const fragment of delta?.tool_calls ?? []) {
-          const index = Number(fragment.index ?? 0);
-          const current = toolCalls.get(index) ?? { id: "", name: "", arguments: "" };
-          current.id ||= fragment.id ?? "";
-          current.name += fragment.function?.name ?? "";
-          current.arguments += fragment.function?.arguments ?? "";
-          toolCalls.set(index, current);
+    let reachedEof = false;
+    let sawDone = false;
+    try {
+      reading: while (true) {
+        const { value, done } = await reader.read();
+        reachedEof = done;
+        buffer += value ?? "";
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+          const data = trimmed.slice(5).trim();
+          if (!data) continue;
+          if (data === "[DONE]") {
+            sawDone = true;
+            break reading;
+          }
+          const chunk = JSON.parse(data);
+          if (chunk.error) throw new Error(chunk.error.message ?? "OpenRouter stream failed");
+          const delta = chunk.choices?.[0]?.delta;
+          if (delta?.content) yield { type: "text_delta", delta: delta.content };
+          for (const fragment of delta?.tool_calls ?? []) {
+            const index = Number(fragment.index ?? 0);
+            const current = toolCalls.get(index) ?? { id: "", name: "", arguments: "" };
+            current.id ||= fragment.id ?? "";
+            current.name += fragment.function?.name ?? "";
+            current.arguments += fragment.function?.arguments ?? "";
+            toolCalls.set(index, current);
+          }
         }
+        if (done) break;
       }
-      if (done) break;
+    } finally {
+      try {
+        // IteratorClose, parse failures, aborts, and the protocol-level DONE
+        // marker must release the underlying fetch connection without waiting
+        // for the server to close its keep-alive body.
+        if (!reachedEof) await reader.cancel().catch(() => undefined);
+      } finally {
+        reader.releaseLock();
+      }
+    }
+    if (!sawDone) {
+      throw new Error("OpenRouter stream ended before the [DONE] marker");
     }
     for (const call of [...toolCalls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call)) {
       yield { type: "tool_call", call: normalizeToolCall(call.id, call.name, call.arguments) };

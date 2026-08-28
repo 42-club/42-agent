@@ -33,3 +33,111 @@ test("OpenRouter streaming assembles fragmented tool calls", async () => {
   assert.deepEqual(events[1], { type: "tool_call", call: { id: "t1", name: "lookup", arguments: { q: "x" } } });
   assert.deepEqual(events[2], { type: "done" });
 });
+
+test("OpenRouter streaming treats DONE as terminal even when the body stays open", async () => {
+  let streamController!: ReadableStreamDefaultController<Uint8Array>;
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+      controller.enqueue(new TextEncoder().encode([
+        'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+        "data: [DONE]",
+        "",
+      ].join("\n")));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const response = new Response(body);
+  const client = new OpenRouterModelClient({
+    apiKey: "test-key",
+    fetch: async () => response,
+  });
+  const iterator = client.stream(request)[Symbol.asyncIterator]();
+  assert.deepEqual(await iterator.next(), {
+    done: false,
+    value: { type: "text_delta", delta: "Hi" },
+  });
+
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    const terminal = await Promise.race([
+      iterator.next(),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("DONE did not terminate the stream")), 250);
+      }),
+    ]);
+    assert.deepEqual(terminal, { done: false, value: { type: "done" } });
+    assert.equal(cancelled, true);
+    assert.equal(response.body?.locked, false);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    if (!cancelled) streamController.close();
+    await iterator.return?.();
+  }
+});
+
+test("OpenRouter streaming cancels and unlocks the body on IteratorClose", async () => {
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(
+        'data: {"choices":[{"delta":{"content":"partial"}}]}\n',
+      ));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const response = new Response(body);
+  const client = new OpenRouterModelClient({ apiKey: "test-key", fetch: async () => response });
+  const iterator = client.stream(request)[Symbol.asyncIterator]();
+
+  assert.deepEqual(await iterator.next(), {
+    done: false,
+    value: { type: "text_delta", delta: "partial" },
+  });
+  await iterator.return?.();
+  assert.equal(cancelled, true);
+  assert.equal(response.body?.locked, false);
+});
+
+test("OpenRouter streaming cancels and unlocks the body after a parse failure", async () => {
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("data: {invalid json}\n"));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const response = new Response(body);
+  const client = new OpenRouterModelClient({ apiKey: "test-key", fetch: async () => response });
+
+  await assert.rejects(async () => {
+    for await (const _event of client.stream(request)) {
+      // The first malformed event fails before anything is yielded.
+    }
+  }, SyntaxError);
+  assert.equal(cancelled, true);
+  assert.equal(response.body?.locked, false);
+});
+
+test("OpenRouter streaming rejects a truncated EOF without DONE", async () => {
+  const client = new OpenRouterModelClient({
+    apiKey: "test-key",
+    fetch: async () => new Response(
+      'data: {"choices":[{"delta":{"content":"partial"}}]}\n',
+      { status: 200 },
+    ),
+  });
+  const events: ModelStreamEvent[] = [];
+
+  await assert.rejects(async () => {
+    for await (const event of client.stream(request)) events.push(event);
+  }, /ended before the \[DONE\] marker/);
+  assert.deepEqual(events, [{ type: "text_delta", delta: "partial" }]);
+});
