@@ -588,6 +588,133 @@ test("ACP accepts a symlink alias for the configured canonical workspace", async
   });
 });
 
+test("ACP migrates quarantined cwd Sessions only through a trusted host allowlist", async () => {
+  let modelCalls = 0;
+  const { runtime, sessionStore } = createRuntime({
+    async complete() {
+      modelCalls += 1;
+      return { content: "restored" };
+    },
+  });
+  const workspace = await realpath(process.cwd());
+  const binding = { kind: "acp.workspace", value: workspace };
+  await sessionStore.create("legacy-approved", { "acp.cwd": workspace, keep: true });
+  await sessionStore.create("legacy-denied", { "acp.cwd": workspace });
+  await sessionStore.create("legacy-bare-binding", {
+    "acp.cwd": workspace,
+    "runtime.binding": binding,
+  });
+
+  // Migration is disabled by default even when the legacy marker matches cwd.
+  await client().connectWith(createTestAcpAgent(runtime), async (context) => {
+    await initialize(context);
+    await assert.rejects(
+      context.request(methods.agent.session.resume, {
+        sessionId: "legacy-approved",
+        cwd: process.cwd(),
+        mcpServers: [],
+      }),
+      (error: unknown) => error instanceof RequestError && error.code === -32002,
+    );
+  });
+
+  const authorizationCalls: string[] = [];
+  const agent = createTestAcpAgent(runtime, {
+    authorizeLegacySessionMigration(request) {
+      assert.equal(Object.isFrozen(request), true);
+      assert.equal(request.workspaceRoot, workspace);
+      authorizationCalls.push(request.sessionId);
+      return request.sessionId === "legacy-approved";
+    },
+  });
+  await client().connectWith(agent, async (context) => {
+    await initialize(context);
+    assert.deepEqual(await context.request(methods.agent.session.resume, {
+      sessionId: "legacy-approved",
+      cwd: process.cwd(),
+      mcpServers: [],
+    }), {});
+    assert.deepEqual(await context.request(methods.agent.session.prompt, {
+      sessionId: "legacy-approved",
+      prompt: [{ type: "text", text: "continue old Session" }],
+    }), { stopReason: "end_turn" });
+
+    for (const sessionId of ["legacy-denied", "legacy-bare-binding"]) {
+      await assert.rejects(
+        context.request(methods.agent.session.resume, {
+          sessionId,
+          cwd: process.cwd(),
+          mcpServers: [],
+        }),
+        (error: unknown) => error instanceof RequestError && error.code === -32002,
+      );
+    }
+    assert.deepEqual(
+      await context.request(methods.agent.session.delete, { sessionId: "legacy-denied" }),
+      {},
+    );
+  });
+
+  assert.equal(modelCalls, 1);
+  assert.deepEqual(authorizationCalls, ["legacy-approved", "legacy-denied"]);
+  const approved = await sessionStore.get("legacy-approved");
+  assert.equal(approved?.metadata["acp.cwd"], undefined);
+  assert.deepEqual(approved?.metadata["runtime.binding"], { version: 1, ...binding });
+  assert.ok(await sessionStore.get("legacy-denied"));
+  assert.deepEqual(
+    (await sessionStore.get("legacy-bare-binding"))?.metadata["runtime.binding"],
+    binding,
+  );
+  await assert.rejects(
+    runtime.resumeSession("legacy-approved"),
+    { name: "SessionBindingMismatchError" },
+  );
+});
+
+test("ACP requires literal true from legacy authorization and redacts callback errors", async () => {
+  const { runtime, sessionStore } = createRuntime({
+    async complete() { return { content: "unused" }; },
+  });
+  const workspace = await realpath(process.cwd());
+  await sessionStore.create("legacy-truthy", { "acp.cwd": workspace });
+  await sessionStore.create("legacy-callback-error", { "acp.cwd": workspace });
+  const secret = "HOST_CALLBACK_SECRET";
+  const agent = createTestAcpAgent(runtime, {
+    authorizeLegacySessionMigration({ sessionId }) {
+      if (sessionId === "legacy-truthy") return "yes" as unknown as boolean;
+      throw RequestError.invalidParams({ secret }, secret);
+    },
+  });
+
+  await client().connectWith(agent, async (context) => {
+    await initialize(context);
+    await assert.rejects(
+      context.request(methods.agent.session.resume, {
+        sessionId: "legacy-truthy",
+        cwd: process.cwd(),
+        mcpServers: [],
+      }),
+      (error: unknown) => error instanceof RequestError && error.code === -32002,
+    );
+    await assert.rejects(
+      context.request(methods.agent.session.resume, {
+        sessionId: "legacy-callback-error",
+        cwd: process.cwd(),
+        mcpServers: [],
+      }),
+      (error: unknown) => error instanceof RequestError
+        && error.code === -32603
+        && error.data === undefined
+        && !error.message.includes(secret),
+    );
+  });
+  assert.equal((await sessionStore.get("legacy-truthy"))?.metadata["runtime.binding"], undefined);
+  assert.equal(
+    (await sessionStore.get("legacy-callback-error"))?.metadata["runtime.binding"],
+    undefined,
+  );
+});
+
 test("ACP cannot be tricked into adopting a foreign Session through generic metadata", async () => {
   const { runtime } = createRuntime({ async complete() { return { content: "unused" }; } });
   const forgedWorkspace = await realpath(process.cwd());

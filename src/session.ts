@@ -55,7 +55,10 @@ export interface SessionStore {
   get(sessionId: string): Promise<Session | undefined>;
   create(sessionId: string, metadata?: Record<string, unknown>): Promise<Session>;
   getOrCreate(sessionId: string): Promise<Session>;
-  /** Update an existing Session at its current version; never recreate a missing Session. */
+  /**
+   * Update an existing Session at its current version; never recreate a missing Session.
+   * Throw SessionSaveOutcomeUnknownError when durability cannot be determined.
+   */
   save(session: Session, options?: SaveSessionOptions): Promise<void>;
   delete(sessionId: string): Promise<boolean>;
 }
@@ -66,6 +69,17 @@ export interface SaveSessionOptions {
    * message prefix is immutable and save may only append messages.
    */
   rewriteMessages?: boolean;
+}
+
+/**
+ * A save may have reached durable storage even though the Store could not
+ * determine its outcome. Callers must reload the Session before any retry.
+ */
+export class SessionSaveOutcomeUnknownError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "SessionSaveOutcomeUnknownError";
+  }
 }
 
 export class InMemorySessionStore implements SessionStore {

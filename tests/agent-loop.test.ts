@@ -3,9 +3,13 @@ import test from "node:test";
 import {
   AgentLoop,
   InMemorySessionStore,
+  SessionSaveOutcomeUnknownError,
   type ModelClient,
   type ModelRequest,
   type ModelResponse,
+  type SaveSessionOptions,
+  type Session,
+  type SessionStore,
   type Tool,
   ToolRegistry,
   createMessage,
@@ -23,6 +27,54 @@ class FakeModel implements ModelClient {
   }
 }
 
+class DurableOutcomeUnknownStore implements SessionStore {
+  readonly error = new SessionSaveOutcomeUnknownError("injected unknown checkpoint outcome");
+  saveCalls = 0;
+  versionAtUnknownSave?: number;
+  private readonly sessions = new Map<string, Session>();
+
+  async get(sessionId: string): Promise<Session | undefined> {
+    const session = this.sessions.get(sessionId);
+    return session ? structuredClone(session) : undefined;
+  }
+
+  async create(
+    sessionId: string,
+    metadata: Record<string, unknown> = {},
+  ): Promise<Session> {
+    if (this.sessions.has(sessionId)) throw new Error(`Session already exists: ${sessionId}`);
+    const session: Session = { id: sessionId, version: 0, messages: [], metadata };
+    this.sessions.set(sessionId, structuredClone(session));
+    return session;
+  }
+
+  async getOrCreate(sessionId: string): Promise<Session> {
+    return await this.get(sessionId) ?? this.create(sessionId);
+  }
+
+  async save(session: Session, _options?: SaveSessionOptions): Promise<void> {
+    this.saveCalls += 1;
+    const expected = session.version ?? 0;
+    const actual = this.sessions.get(session.id)?.version ?? -1;
+    if (actual !== expected) {
+      throw new Error(`stale Session retry: expected ${expected}, found ${actual}`);
+    }
+
+    const durable = structuredClone(session);
+    durable.version = expected + 1;
+    this.sessions.set(session.id, durable);
+    if (this.saveCalls === 2) {
+      this.versionAtUnknownSave = session.version;
+      throw this.error;
+    }
+    session.version = durable.version;
+  }
+
+  async delete(sessionId: string): Promise<boolean> {
+    return this.sessions.delete(sessionId);
+  }
+}
+
 test("runs a turn with external prompt injection", async () => {
   const model = new FakeModel([{ content: "hello" }]);
   const tools = new ToolRegistry();
@@ -37,6 +89,35 @@ test("runs a turn with external prompt injection", async () => {
   assert.equal(result, "hello");
   assert.match(model.prompts[0]!, /channel instruction/);
   assert.equal((await store.getOrCreate("s1")).messages.length, 2);
+});
+
+test("does not terminal-save a Session after a checkpoint outcome becomes unknown", async () => {
+  const store = new DurableOutcomeUnknownStore();
+  let modelCalls = 0;
+  const loop = new AgentLoop({
+    model: {
+      async complete() {
+        modelCalls += 1;
+        return { content: "must not run" };
+      },
+    },
+    tools: new ToolRegistry(),
+    sessionStore: store,
+    requestApproval: async () => false,
+  });
+
+  await assert.rejects(
+    loop.runTurn({ sessionId: "unknown-checkpoint", userInput: "go" }),
+    (error) => error === store.error,
+  );
+
+  assert.equal(store.saveCalls, 2);
+  assert.equal(store.versionAtUnknownSave, 1);
+  assert.equal(modelCalls, 0);
+  const durable = await store.get("unknown-checkpoint");
+  assert.equal(durable?.version, 2);
+  assert.equal(durable?.runState?.status, "running");
+  assert.equal(durable?.runState?.phase, "model");
 });
 
 test("performs a tool round trip", async () => {

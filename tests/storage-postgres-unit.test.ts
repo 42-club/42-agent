@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import type { Pool } from "pg";
+import { SessionSaveOutcomeUnknownError } from "../src/index.js";
 import { PostgresSessionStore } from "../src/storage/index.js";
 
 test("uncertain COMMIT releases a one-client pool before checkpoint verification", async () => {
@@ -43,8 +44,10 @@ test("unverified COMMIT is surfaced as unknown and is never retried", async () =
     pool: fixture.pool,
   });
   const session = { id: "session", version: 0, messages: [], metadata: {} };
-  await assert.rejects(store.save(session), {
-    name: "PostgresTransactionOutcomeUnknownError",
+  await assert.rejects(store.save(session), (error) => {
+    assert.equal((error as Error).name, "PostgresTransactionOutcomeUnknownError");
+    assert.ok(error instanceof SessionSaveOutcomeUnknownError);
+    return true;
   });
   assert.equal(session.version, 0);
   assert.equal(fixture.verificationCount, 1);

@@ -64,8 +64,21 @@ roots. New ACP Sessions receive a protected Runtime binding to that root; generi
 set or replace it. Resume, prompt, cancel, and delete atomically require the same binding, so a forged
 metadata key or a delete/recreate race cannot cross adapter ownership. Missing or foreign bindings are
 rejected without exposing whether an existing Session is foreign. Resume and prompt reject a nonexistent
-Session, while delete remains idempotent. `session/cancel` affects only a prompt
-admitted by this adapter. To bridge Runtime approvals to the active ACP client, use the same `AcpPermissionBridge` when
+Session, while delete remains idempotent. `session/cancel` affects only a prompt admitted by this adapter.
+
+The persisted binding is an exact versioned envelope (`{ version: 1, kind, value }`). This envelope is the
+trust boundary for the binding format introduced in this unreleased change: an older bare
+`runtime.binding` object is quarantined rather than promoted. Sessions created by the previous ACP adapter
+carry only `acp.cwd`; that key was generic metadata and is therefore also insufficient proof of ownership.
+Both legacy forms are hidden from unbound channels as missing Sessions, and current generic metadata strips
+both reserved keys. To retain a known pre-upgrade ACP Session, supply
+`authorizeLegacySessionMigration` with a trusted Session-ID allowlist or equivalent external inventory.
+Approval must not be based only on the stored `acp.cwd` or requested workspace. After approval, the Runtime
+re-checks the exact marker inside the per-Session FIFO, removes it, and performs one versioned save. An
+outcome-unknown save is returned to the host without retry; reload the Session to learn whether the binding
+became durable.
+
+To bridge Runtime approvals to the active ACP client, use the same `AcpPermissionBridge` when
 constructing both `AgentLoop` and the adapter. The snippet assumes `model`, `tools`, and `sessionStore`
 have been configured as in [`examples/minimal.ts`](./examples/minimal.ts):
 
@@ -265,13 +278,15 @@ it](https://supabase.com/docs/guides/database/connecting-to-postgres). PostgreSQ
 the private `agent_runtime` schema and are keyed by `(namespace, session ID)`; the application must ensure
 that no two processes own the same pair concurrently.
 
-For each Supabase `databaseUrl` and `migrationUrl`, TLS defaults to `ssl: true` when that URL contains no
-PostgreSQL TLS parameter (`ssl`, `sslmode`, `sslcert`, `sslkey`, `sslrootcert`, or `sslnegotiation`). If a
-URL contains one of those parameters, the library leaves TLS parsing to `pg` for that connection. An
-explicit profile-level `ssl` setting cannot be combined with TLS parameters in either URL. Set
-`ssl: false` only for an intentionally plaintext local or self-hosted database; never disable TLS for
-hosted Supabase. The safe resolution diagnostic includes `ssl` when the library selected it and omits the
-field when the URL controls TLS.
+For each Supabase `databaseUrl` and `migrationUrl`, TLS defaults to `ssl: true` unless that URL contains an
+option that actually configures SSL (`ssl`, `sslmode`, `sslcert`, `sslkey`, `sslrootcert`, or
+`sslnegotiation=direct`). `sslnegotiation=postgres` changes only the handshake, so by itself it retains the
+secure profile default. Empty, repeated, or unknown negotiation parameters are rejected rather than being
+allowed to suppress TLS accidentally. When the URL configures SSL, the library leaves its effective value
+to `pg`; an explicit profile-level `ssl` setting cannot be combined with those URL options. Set `ssl: false`
+only for an intentionally plaintext local or self-hosted database; never disable TLS for hosted Supabase.
+The safe resolution diagnostic includes `ssl` when the library selected it and omits the field when the URL
+controls TLS.
 
 PostgreSQL-backed startup defaults to `schemaMode: "check"`. Apply DDL explicitly in a deployment step
 with `migratePostgresSchema(...)`, or opt a profile into `schemaMode: "migrate"`; an optional
@@ -366,6 +381,8 @@ Another channel that resolves to `shared-session` will continue the same canonic
 - A tool left in `running` state after a crash is treated as having an unknown outcome and is not replayed.
 - Store `save` operations update an existing version only; a late save cannot recreate a deleted session.
   Existing message prefixes are append-only unless `rewriteMessages` is explicit.
+- A Store that cannot determine whether a save committed throws `SessionSaveOutcomeUnknownError`; the Loop
+  does not attempt another save from the stale Session, and the host must reload before reconciliation.
 - Event observers receive detached frozen values; exceptions, mutation attempts, and unresolved callbacks
   are isolated from canonical run and tool status. Adapters own ordered delivery and backpressure.
 - The runtime does not claim exactly-once execution for external side effects.

@@ -279,6 +279,56 @@ test("HTTP runtime bounds bodies and rejects untrusted browser writes", async ()
   }
 });
 
+test("HTTP projects every untrusted legacy binding representation as not found", async () => {
+  let modelCalls = 0;
+  const sessions = new InMemorySessionStore();
+  const loop = new AgentLoop({
+    model: {
+      async complete() {
+        modelCalls += 1;
+        return { content: "must not run" };
+      },
+    },
+    tools: new ToolRegistry(),
+    sessionStore: sessions,
+    requestApproval: async () => false,
+  });
+  const workspace = "/forged/workspace";
+  const binding = { kind: "acp.workspace", value: workspace };
+  await sessions.create("http-legacy-cwd", { "acp.cwd": workspace });
+  await sessions.create("http-bare-binding", { "runtime.binding": binding });
+  await sessions.create("http-mixed-binding", {
+    "runtime.binding": { version: 1, ...binding },
+    "acp.cwd": workspace,
+  });
+  const server = createAgentRuntimeHttpServer(new AgentRuntime({ loop }), { port: 0 });
+  const address = await server.listen();
+
+  try {
+    for (const sessionId of [
+      "http-legacy-cwd",
+      "http-bare-binding",
+      "http-mixed-binding",
+    ]) {
+      const response = await fetch(`http://${address.host}:${address.port}/v1/turn`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId, userInput: "take over" }),
+      });
+      assert.equal(response.status, 404);
+      assert.deepEqual(await response.json(), {
+        type: "error",
+        code: "SessionNotFound",
+        message: "Session not found",
+      });
+      assert.deepEqual((await sessions.get(sessionId))?.messages, []);
+    }
+    assert.equal(modelCalls, 0);
+  } finally {
+    await server.close();
+  }
+});
+
 test("HTTP classifies admission failures and redacts internal streaming errors", async () => {
   const secret = "postgresql://admin:super-secret@database.internal/runtime";
   const model: ModelClient = {

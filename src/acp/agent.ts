@@ -15,6 +15,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import {
   AgentRuntime,
+  LegacySessionBindingMigrationRequiredError,
   RuntimeClosedError,
   SessionBindingMismatchError,
   SessionClosingError,
@@ -25,6 +26,7 @@ import { AcpPermissionBridge } from "./permission.js";
 import { AcpUpdateProjector } from "./projector.js";
 
 const ACP_BINDING_KIND = "acp.workspace";
+const LEGACY_ACP_CWD_METADATA = "acp.cwd";
 const DEFAULT_MAX_PENDING_UPDATES = 256;
 const DEFAULT_UPDATE_DELIVERY_TIMEOUT_MS = 10_000;
 
@@ -45,6 +47,14 @@ export interface AcpAgentOptions {
   updateDeliveryTimeoutMs?: number;
   /** Optional bridge whose requestApproval hook was supplied to AgentLoop. */
   permissionBridge?: AcpPermissionBridge;
+  /**
+   * Host-owned authorization for migrating an ACP Session created before
+   * protected bindings existed. Omit by default. Approval must come from a
+   * trusted Session-ID allowlist, never from persisted `acp.cwd` alone.
+   */
+  authorizeLegacySessionMigration?: (
+    request: Readonly<{ sessionId: string; workspaceRoot: string }>,
+  ) => boolean | Promise<boolean>;
 }
 
 /** Build a stable ACP v1 agent over the protocol-neutral AgentRuntime. */
@@ -67,6 +77,7 @@ export function createAcpAgent(
   if (!Number.isSafeInteger(updateDeliveryTimeoutMs) || updateDeliveryTimeoutMs < 1) {
     throw new RangeError("updateDeliveryTimeoutMs must be a positive safe integer");
   }
+  const authorizeLegacySessionMigration = options.authorizeLegacySessionMigration;
 
   const activePrompts = new Map<string, Set<AbortController>>();
   let activeConnection: AgentConnection | undefined;
@@ -121,9 +132,12 @@ export function createAcpAgent(
     .onRequest(methods.agent.session.resume, async ({ params }) => {
       await validateWorkspaceRequest(params, workspaceRoot);
       try {
-        await runtime.resumeSession(params.sessionId, {
-          expectedBinding: acpSessionBinding(workspaceRoot),
-        });
+        await resumeAcpSession(
+          runtime,
+          params.sessionId,
+          workspaceRoot,
+          authorizeLegacySessionMigration,
+        );
         return {};
       } catch (error) {
         throw toRequestError(error, params.sessionId);
@@ -220,6 +234,42 @@ export function createAcpAgent(
 
 function acpSessionBinding(workspaceRoot: string): SessionBinding {
   return { kind: ACP_BINDING_KIND, value: workspaceRoot };
+}
+
+async function resumeAcpSession(
+  runtime: AgentRuntime,
+  sessionId: string,
+  workspaceRoot: string,
+  authorizeLegacySessionMigration: AcpAgentOptions["authorizeLegacySessionMigration"],
+): Promise<void> {
+  const binding = acpSessionBinding(workspaceRoot);
+  try {
+    await runtime.resumeSession(sessionId, { expectedBinding: binding });
+    return;
+  } catch (error) {
+    if (!(error instanceof LegacySessionBindingMigrationRequiredError)
+      || !authorizeLegacySessionMigration) {
+      throw error;
+    }
+    let approved: boolean;
+    try {
+      approved = await authorizeLegacySessionMigration(Object.freeze({
+        sessionId,
+        workspaceRoot,
+      }));
+    } catch (cause) {
+      // A host callback is not a protocol extension point. In particular, a
+      // RequestError thrown by it must not pass through to an untrusted client.
+      throw new Error("Legacy Session migration authorization failed", { cause });
+    }
+    if (approved !== true) throw error;
+  }
+
+  await runtime.migrateLegacySessionBinding(sessionId, {
+    legacyMetadata: { key: LEGACY_ACP_CWD_METADATA, value: workspaceRoot },
+    binding,
+  });
+  await runtime.resumeSession(sessionId, { expectedBinding: binding });
 }
 
 function normalizePrompt(prompt: readonly ContentBlock[]): Array<{ type: "text"; text: string }> {

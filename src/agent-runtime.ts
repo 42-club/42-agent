@@ -51,6 +51,16 @@ export interface SessionAccessOptions {
   expectedBinding?: SessionBinding;
 }
 
+export interface LegacySessionBindingMigrationInput {
+  /** Exact protected metadata marker used by a known pre-binding adapter version. */
+  legacyMetadata: {
+    key: string;
+    value: string;
+  };
+  /** Trusted binding to persist after the embedding host authorizes this Session ID. */
+  binding: SessionBinding;
+}
+
 export interface PromptInput {
   sessionId: string;
   content: readonly RuntimeContentPart[];
@@ -139,7 +149,15 @@ interface ResolvedPromptSession {
 const SESSION_SKILLS = "runtime.skills";
 const SESSION_TOOLS = "runtime.tools";
 const SESSION_BINDING = "runtime.binding";
-const RESERVED_SESSION_METADATA = [SESSION_SKILLS, SESSION_TOOLS, SESSION_BINDING] as const;
+const SESSION_BINDING_VERSION = 1;
+const LEGACY_ACP_CWD_METADATA = "acp.cwd";
+const LEGACY_SESSION_BINDING_METADATA = [LEGACY_ACP_CWD_METADATA] as const;
+const RESERVED_SESSION_METADATA = [
+  SESSION_SKILLS,
+  SESSION_TOOLS,
+  SESSION_BINDING,
+  ...LEGACY_SESSION_BINDING_METADATA,
+] as const;
 
 /** Protocol-neutral lifecycle facade used by ACP, HTTP, CLI, and embedded hosts. */
 export class AgentRuntime {
@@ -237,6 +255,50 @@ export class AgentRuntime {
       const session = await this.requireSession(sessionId);
       assertExpectedBinding(session, expectedBinding);
       return this.toSessionInfo(session, false);
+    } finally {
+      this.endSessionOperation(sessionId, operation);
+    }
+  }
+
+  /**
+   * Upgrade one host-authorized legacy ownership marker inside the Session FIFO.
+   * The caller must authorize the Session ID from trusted provenance; persisted
+   * metadata is only re-checked here and is never sufficient authorization.
+   */
+  async migrateLegacySessionBinding(
+    sessionId: string,
+    input: LegacySessionBindingMigrationInput,
+  ): Promise<SessionInfo> {
+    this.assertAvailable();
+    assertValidSessionId(sessionId);
+    const request = snapshotLegacySessionBindingMigrationInput(input);
+    const operation = this.beginSessionOperation(sessionId, request.binding);
+    try {
+      return await this.dependencies.loop.runSessionOperationDeferred(sessionId, async () => {
+        const session = await this.requireSession(sessionId);
+        if (Object.hasOwn(session.metadata, SESSION_BINDING)) {
+          const existing = readVersionedSessionBinding(session);
+          // Concurrent trusted migrations may join after the first save. Do not
+          // save again; in particular, never retry an outcome-unknown write.
+          if (sameBinding(existing, request.binding)
+            && !Object.hasOwn(session.metadata, request.legacyMetadata.key)) {
+            return this.toSessionInfo(session, false);
+          }
+          throw new SessionBindingMismatchError(sessionId);
+        }
+        if (!Object.hasOwn(session.metadata, request.legacyMetadata.key)
+          || session.metadata[request.legacyMetadata.key] !== request.legacyMetadata.value) {
+          throw new SessionBindingMismatchError(sessionId);
+        }
+
+        const migrated: Session = { ...session, metadata: { ...session.metadata } };
+        delete migrated.metadata[request.legacyMetadata.key];
+        migrated.metadata[SESSION_BINDING] = storedSessionBinding(request.binding);
+        // Exactly one versioned save. Outcome-unknown errors propagate so the
+        // host reloads instead of guessing whether a retry is safe.
+        await this.dependencies.sessionStore.save(migrated);
+        return this.toSessionInfo(migrated, false);
+      });
     } finally {
       this.endSessionOperation(sessionId, operation);
     }
@@ -646,16 +708,23 @@ export class SessionClosingError extends Error {
 }
 
 export class SessionBindingMismatchError extends Error {
-  constructor(sessionId: string) {
-    super(`Session binding does not match: ${sessionId}`);
+  constructor(sessionId: string, message = `Session binding does not match: ${sessionId}`) {
+    super(message);
     this.name = "SessionBindingMismatchError";
   }
 }
 
-export class InvalidSessionBindingError extends Error {
+export class InvalidSessionBindingError extends SessionBindingMismatchError {
   constructor(sessionId: string) {
-    super(`Session has invalid persisted binding metadata: ${sessionId}`);
+    super(sessionId, `Session has invalid persisted binding metadata: ${sessionId}`);
     this.name = "InvalidSessionBindingError";
+  }
+}
+
+export class LegacySessionBindingMigrationRequiredError extends SessionBindingMismatchError {
+  constructor(sessionId: string) {
+    super(sessionId, `Session requires trusted legacy binding migration: ${sessionId}`);
+    this.name = "LegacySessionBindingMigrationRequiredError";
   }
 }
 
@@ -730,7 +799,7 @@ function sessionMetadata(
     ...metadata,
     ...(input.tools ? { [SESSION_TOOLS]: [...input.tools] } : {}),
     ...(input.skills ? { [SESSION_SKILLS]: [...input.skills] } : {}),
-    ...(input.binding ? { [SESSION_BINDING]: { ...input.binding } } : {}),
+    ...(input.binding ? { [SESSION_BINDING]: storedSessionBinding(input.binding) } : {}),
   };
 }
 
@@ -768,16 +837,61 @@ function snapshotSessionBinding(binding: SessionBinding | undefined): SessionBin
   return { kind: binding.kind, value: binding.value };
 }
 
+function snapshotLegacySessionBindingMigrationInput(
+  input: LegacySessionBindingMigrationInput,
+): LegacySessionBindingMigrationInput {
+  const key = input?.legacyMetadata?.key;
+  const value = input?.legacyMetadata?.value;
+  if (!LEGACY_SESSION_BINDING_METADATA.some((candidate) => candidate === key)) {
+    throw new TypeError("Unsupported legacy Session binding metadata key");
+  }
+  if (typeof value !== "string" || value.length === 0) {
+    throw new TypeError("Legacy Session binding metadata value must be a non-empty string");
+  }
+  const binding = snapshotSessionBinding(input.binding);
+  if (!binding) throw new TypeError("Session binding is required");
+  return { legacyMetadata: { key, value }, binding };
+}
+
 function readSessionBinding(session: Session): SessionBinding | undefined {
+  const hasLegacyMarker = LEGACY_SESSION_BINDING_METADATA.some(
+    (key) => Object.hasOwn(session.metadata, key),
+  );
+  const binding = readVersionedSessionBinding(session);
+  // Current writers and the trusted migrator make these representations
+  // mutually exclusive. Their coexistence therefore has no trusted provenance.
+  if (binding && hasLegacyMarker) throw new InvalidSessionBindingError(session.id);
+  if (binding) return binding;
+  if (hasLegacyMarker) {
+    throw new LegacySessionBindingMigrationRequiredError(session.id);
+  }
+  return undefined;
+}
+
+function readVersionedSessionBinding(session: Session): SessionBinding | undefined {
   if (!Object.hasOwn(session.metadata, SESSION_BINDING)) return undefined;
   const value = session.metadata[SESSION_BINDING];
+  const keys = isRecord(value) ? Reflect.ownKeys(value) : [];
   if (!isRecord(value)
-    || Object.keys(value).some((key) => key !== "kind" && key !== "value")
+    || keys.length !== 3
+    || keys.some((key) => key !== "version" && key !== "kind" && key !== "value")
+    || !Object.hasOwn(value, "version")
+    || !Object.hasOwn(value, "kind")
+    || !Object.hasOwn(value, "value")
+    || value.version !== SESSION_BINDING_VERSION
     || typeof value.kind !== "string" || value.kind.length === 0
     || typeof value.value !== "string" || value.value.length === 0) {
     throw new InvalidSessionBindingError(session.id);
   }
   return { kind: value.kind, value: value.value };
+}
+
+function storedSessionBinding(binding: SessionBinding): Record<string, unknown> {
+  return {
+    version: SESSION_BINDING_VERSION,
+    kind: binding.kind,
+    value: binding.value,
+  };
 }
 
 function assertExpectedBinding(session: Session, expected: SessionBinding | undefined): void {

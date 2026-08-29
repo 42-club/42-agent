@@ -25,6 +25,7 @@ import { SteeringQueue } from "./runtime/steering.js";
 import { CoordinatedToolExecutor } from "./runtime/tool-executor.js";
 import {
   createMessage,
+  SessionSaveOutcomeUnknownError,
   type RunState,
   type SaveSessionOptions,
   type Session,
@@ -147,6 +148,17 @@ export class AgentLoop {
       await authorize();
       return this.recoverSessionSerialized(sessionId);
     });
+  }
+
+  /**
+   * Run one trusted Runtime lifecycle mutation in the canonical Session FIFO.
+   * The callback must not re-enter this method for the same Session. @internal
+   */
+  runSessionOperationDeferred<Result>(
+    sessionId: string,
+    operation: () => Promise<Result>,
+  ): Promise<Result> {
+    return this.enqueueSession(sessionId, operation);
   }
 
   private async recoverSessionSerialized(sessionId: string): Promise<RecoveryResult> {
@@ -352,6 +364,11 @@ export class AgentLoop {
       throw new Error("Agent exceeded maximum tool rounds");
     } catch (error) {
       this.steering.end(session.id, runState.id);
+      // The failed checkpoint may already be durable while this live Session
+      // still carries its old version. Reload is the only safe next action;
+      // attempting a terminal checkpoint here could overwrite state or mask
+      // the outcome-unknown error with a version conflict.
+      if (error instanceof SessionSaveOutcomeUnknownError) throw error;
       const cancelled = input.signal?.aborted || isAbortError(error);
       // A checkpoint can fail after the assistant tool-call message or a live
       // call-state mutation. Always close that protocol batch before persisting

@@ -4,6 +4,7 @@ import {
   assertValidSessionId,
   MessageHistoryRewriteRequiredError,
   SessionAlreadyExistsError,
+  SessionSaveOutcomeUnknownError,
   SessionVersionConflictError,
   type Message,
   type RunState,
@@ -445,7 +446,7 @@ export class PostgresSessionStore implements ManagedSessionStore {
   }
 }
 
-export class PostgresTransactionOutcomeUnknownError extends Error {
+export class PostgresTransactionOutcomeUnknownError extends SessionSaveOutcomeUnknownError {
   readonly sessionId: string;
   readonly checkpointId: string;
 

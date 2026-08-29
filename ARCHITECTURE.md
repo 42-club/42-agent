@@ -95,6 +95,17 @@ are rejected without disclosing their ownership; missing resume/prompt targets f
 idempotent. Cancel targets only prompts admitted with the same binding, and protocol input never widens
 Tool roots.
 
+The protected value is persisted only as the exact versioned envelope `{ version: 1, kind, value }`, which
+is the trust boundary introduced by this unreleased binding format. Neither the former generic `acp.cwd`
+marker nor an older bare `{ kind, value }` `runtime.binding` has trustworthy provenance, so both are
+fail-closed quarantined and unbound protocol adapters project them as missing. Generic Session metadata
+also strips the legacy marker. A host may retain an origin/main-era ACP Session only through the optional
+`authorizeLegacySessionMigration` callback backed by a trusted Session-ID allowlist or external inventory;
+matching `cwd` metadata alone must never authorize migration. Once approved, `AgentRuntime` re-reads and
+validates the exact legacy marker within the Loop's per-Session FIFO, removes it, and performs a single
+versioned save. Save outcome-unknown is propagated without retry so the host must reload before deciding
+what happened.
+
 Update projection has a bounded pending count and per-delivery timeout. Backpressure, timeout, transport
 failure, request cancellation, session cancellation/deletion, and Runtime shutdown all terminate the
 prompt scope without waiting forever on a client notification or permission request. ACP v1 cannot
@@ -168,6 +179,11 @@ identity. Their tables live in the private `agent_runtime` schema, not `public`,
 Session version, messages, current Run, and tool calls in one transaction. A Supabase profile accepts a
 PostgreSQL database URL (normally direct connection for a persistent backend, or session pooler when IPv4
 requires it); it does not use `supabase-js`, the REST/GraphQL Data API, or a browser key.
+
+If a Store loses the acknowledgement for a commit and cannot verify whether that checkpoint became
+durable, it throws `SessionSaveOutcomeUnknownError` and leaves the live Session version unchanged.
+`AgentLoop` propagates that error without attempting a terminal save from the stale object; the embedding
+host must reload before retrying or reconciling the Run.
 
 Opening a PostgreSQL-backed Store checks the schema by default. Applying DDL is explicit through the
 migration API or a deployment step; migration credentials may be separate from runtime credentials.

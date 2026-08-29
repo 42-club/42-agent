@@ -55,7 +55,13 @@ Prompt，而不会无限堆积更新。Prompt 支持文本和基础 `resource_li
 Runtime Binding，通用 Session Metadata 无法设置或替换它。Resume、Prompt、Cancel 与 Delete 会原子
 校验同一 Binding，因此伪造 Metadata Key 或 Delete/Recreate 竞态都不能越过 Adapter 所有权边界。
 缺失或外来的 Binding 会被拒绝，且不会泄漏已有 Session 是否属于其他 Workspace。Resume 与 Prompt
-会拒绝不存在的 Session，Delete 则保持幂等。
+会拒绝不存在的 Session，Delete 则保持幂等。持久化 Binding 使用精确的版本化封装
+`{ version: 1, kind, value }`。旧版裸 `runtime.binding` 与升级前的 `acp.cwd` 都没有可信来源，默认会被
+隔离，并在未绑定 Channel 中表现为 Session 不存在；当前通用 Metadata 也会剥离这两个保留 Key。
+如需保留已确认的旧 ACP Session，宿主必须通过 `authorizeLegacySessionMigration` 按可信 Session-ID
+Allowlist 或外部清单显式授权，不能只依据持久化的 `acp.cwd`。授权后 Runtime 会在同一 Session FIFO
+内重新核验旧 Marker、删除它并只保存一次；若保存结果未知，则原样返回给宿主并要求重新加载确认。
+
 `session/cancel` 只影响由当前 Adapter 接纳的 Prompt。要把 Runtime 审批桥接到当前 ACP Client，
 构建 `AgentLoop` 与 ACP Adapter 时必须使用同一个 `AcpPermissionBridge`。下例假设 `model`、`tools`
 和 `sessionStore` 已按 [`examples/minimal.ts`](./examples/minimal.ts) 完成配置：
@@ -248,12 +254,13 @@ Pooler](https://supabase.com/docs/guides/database/connecting-to-postgres)。Post
 `agent_runtime` Schema，并以 `(namespace, Session ID)` 为键；应用必须保证不会有两个进程同时拥有
 同一组合。
 
-对每个 Supabase `databaseUrl` 和 `migrationUrl`，如果该 URL 不包含任何 PostgreSQL TLS 参数
-（`ssl`、`sslmode`、`sslcert`、`sslkey`、`sslrootcert` 或 `sslnegotiation`），TLS 默认为
-`ssl: true`；如果 URL 已包含其中任一参数，本库会让 `pg` 为该连接解析 TLS 设置。Profile 级
-`ssl` 显式配置不能与任一 URL 中的 TLS 参数混用。只有在本地或自托管数据库明确使用明文连接时
-才设置 `ssl: false`；Hosted Supabase 绝不能关闭 TLS。安全解析诊断会在本库决定 TLS 时显示
-`ssl`，由 URL 控制 TLS 时则省略该字段。
+对每个 Supabase `databaseUrl` 和 `migrationUrl`，除非 URL 中存在真正配置 SSL 的选项（`ssl`、
+`sslmode`、`sslcert`、`sslkey`、`sslrootcert` 或 `sslnegotiation=direct`），TLS 都默认为
+`ssl: true`。单独的 `sslnegotiation=postgres` 只改变握手方式，因此仍保留安全默认值。空值、重复值
+或未知的协商参数会被直接拒绝，避免意外关闭 TLS。URL 配置 SSL 时由 `pg` 解析最终值，Profile 级
+`ssl` 不能与这些 URL 选项混用。只有在本地或自托管数据库明确使用明文连接时才设置 `ssl: false`；
+Hosted Supabase 绝不能关闭 TLS。安全解析诊断会在本库决定 TLS 时显示 `ssl`，由 URL 控制 TLS 时则
+省略该字段。
 
 PostgreSQL 引擎默认以 `schemaMode: "check"` 启动。DDL 应通过部署步骤显式执行：调用
 `migratePostgresSchema(...)`，或为 Profile 显式设置 `schemaMode: "migrate"`；可选的
@@ -343,6 +350,8 @@ npm run cli -- --session shared-session
 - 崩溃时仍处于 `running` 状态的工具，其结果会被视为未知，不会自动重放。
 - Store 的 `save` 只更新已存在的版本；晚到保存不能重新创建已删除 Session。默认只允许追加
   Message；修改已有 Message 必须显式使用 `rewriteMessages`。
+- Store 无法判断一次保存是否已经提交时会抛出 `SessionSaveOutcomeUnknownError`；Loop 不会使用旧
+  Session 再次保存，宿主必须重新加载后再对账。
 - Event Observer 只收到深拷贝冻结值；异常、篡改尝试和永不完成的回调都不会改变或卡住规范状态。
   Adapter 自己负责事件顺序与背压。
 - Runtime 不保证具有外部副作用的操作 exactly-once 执行。
