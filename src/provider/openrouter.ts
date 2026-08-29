@@ -1,5 +1,17 @@
-import type { ModelClient, ModelRequest, ModelResponse, ModelStreamEvent, ToolCall } from "../model.js";
-import type { Message } from "../session.js";
+import {
+  estimateTokenUpperBound,
+  type ModelCapabilities,
+  type ModelClient,
+  type ModelRequest,
+  type ModelResponse,
+  type ModelStreamEvent,
+  type ToolCall,
+} from "../model.js";
+import {
+  toOpenAiCompatiblePayload,
+  type OpenAiCompatibleToolCall,
+} from "./openai-compatible-payload.js";
+import { OpenRouterCapabilitiesResolver } from "./openrouter-capabilities.js";
 
 export interface OpenRouterConfig {
   apiKey: string;
@@ -8,32 +20,41 @@ export interface OpenRouterConfig {
   appName?: string;
   httpReferer?: string;
   fetch?: typeof fetch;
-}
-
-interface OpenRouterToolCall {
-  id: string;
-  type: "function";
-  function: { name: string; arguments: string };
-}
-
-interface OpenRouterMessage {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
-  name?: string;
-  tool_call_id?: string;
-  tool_calls?: OpenRouterToolCall[];
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
 }
 
 export class OpenRouterModelClient implements ModelClient {
   readonly model: string;
   private readonly baseUrl: string;
   private readonly fetcher: typeof fetch;
+  private readonly capabilitiesResolver: OpenRouterCapabilitiesResolver;
 
   constructor(private readonly config: OpenRouterConfig) {
     if (!config.apiKey) throw new Error("OPENROUTER_API_KEY is required");
     this.model = config.model ?? "anthropic/claude-opus-4.6";
     this.baseUrl = (config.baseUrl ?? "https://openrouter.ai/api/v1").replace(/\/$/, "");
     this.fetcher = config.fetch ?? fetch;
+    this.capabilitiesResolver = new OpenRouterCapabilitiesResolver({
+      apiKey: config.apiKey,
+      model: this.model,
+      baseUrl: this.baseUrl,
+      fetch: this.fetcher,
+      contextWindowTokens: config.contextWindowTokens,
+      maxOutputTokens: config.maxOutputTokens,
+    });
+  }
+
+  get capabilities(): ModelCapabilities | undefined {
+    return this.capabilitiesResolver.capabilities;
+  }
+
+  getCapabilities(signal?: AbortSignal): Promise<ModelCapabilities> {
+    return this.capabilitiesResolver.getCapabilities(signal);
+  }
+
+  estimateRequestTokens(request: ModelRequest): number {
+    return estimateTokenUpperBound(JSON.stringify(this.payload(request, false)));
   }
 
   static fromEnv(overrides: Partial<OpenRouterConfig> = {}): OpenRouterModelClient {
@@ -44,6 +65,8 @@ export class OpenRouterModelClient implements ModelClient {
       appName: overrides.appName ?? process.env.OPENROUTER_APP_NAME ?? "42 Agent",
       httpReferer: overrides.httpReferer ?? process.env.OPENROUTER_HTTP_REFERER,
       fetch: overrides.fetch,
+      contextWindowTokens: overrides.contextWindowTokens,
+      maxOutputTokens: overrides.maxOutputTokens,
     });
   }
 
@@ -129,34 +152,11 @@ export class OpenRouterModelClient implements ModelClient {
   }
 
   private payload(request: ModelRequest, stream: boolean): Record<string, unknown> {
-    return {
-      model: this.model,
-      messages: toOpenRouterMessages(request.messages, request.systemPrompt),
-      tools: request.tools.map((tool) => ({ type: "function", function: { name: tool.name, description: tool.description, parameters: tool.inputSchema } })),
-      stream,
-    };
+    return toOpenAiCompatiblePayload(this.model, request, stream);
   }
 }
 
-function toOpenRouterMessages(messages: readonly Message[], systemPrompt: string): OpenRouterMessage[] {
-  const converted: OpenRouterMessage[] = [{ role: "system", content: systemPrompt }];
-  for (const message of messages) {
-    if (message.role === "tool") {
-      converted.push({ role: "tool", content: message.content, name: message.name, tool_call_id: message.toolCallId });
-    } else if (message.role === "assistant") {
-      const calls = (message.metadata?.toolCalls as ToolCall[] | undefined) ?? [];
-      converted.push({
-        role: "assistant", content: message.content || null,
-        tool_calls: calls.length ? calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } })) : undefined,
-      });
-    } else {
-      converted.push({ role: message.role, content: message.content });
-    }
-  }
-  return converted;
-}
-
-function parseToolCalls(calls: OpenRouterToolCall[]): ToolCall[] {
+function parseToolCalls(calls: OpenAiCompatibleToolCall[]): ToolCall[] {
   return calls.map((call) => normalizeToolCall(call.id, call.function.name, call.function.arguments));
 }
 

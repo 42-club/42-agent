@@ -24,8 +24,18 @@ export interface ToolDefinition {
   inputSchema: Record<string, unknown>;
 }
 
+export interface ModelCapabilities {
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
+}
+
 export interface ModelClient {
-  capabilities?: { contextWindowTokens?: number; maxOutputTokens?: number };
+  /** Immediately available limits, when the client was configured with them or already resolved them. */
+  readonly capabilities?: ModelCapabilities;
+  /** Resolve provider/model-specific limits. Implementations should cache successful lookups. */
+  getCapabilities?(signal?: AbortSignal): Promise<ModelCapabilities | undefined>;
+  /** Estimate all input tokens in the provider-serialized request, excluding generated output. */
+  estimateRequestTokens?(request: ModelRequest): number | Promise<number>;
   complete(request: ModelRequest): Promise<ModelResponse>;
   stream?(request: ModelRequest): AsyncIterable<ModelStreamEvent>;
 }
@@ -38,8 +48,38 @@ export function supportsModelStreaming(model: ModelClient): model is StreamingMo
 }
 
 export function estimateTokens(text: string): number {
-  // Conservative provider-neutral estimate; providers may add an exact counter later.
-  return Math.ceil(text.length / 3);
+  // Coarse provider-neutral estimate for compression sizing. Do not use this
+  // heuristic as a hard request-admission upper bound.
+  let tokens = 0;
+  let asciiRunLength = 0;
+  for (const character of text) {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint <= 0x7F) {
+      asciiRunLength += 1;
+      continue;
+    }
+    const bytes = codePoint <= 0x7FF ? 2 : codePoint <= 0xFFFF ? 3 : 4;
+    tokens += Math.ceil(asciiRunLength / 2) + Math.ceil(bytes / 3);
+    asciiRunLength = 0;
+  }
+  return tokens + Math.ceil(asciiRunLength / 2);
+}
+
+/**
+ * Conservative tokenizer-independent upper bound for UTF-8 request payloads.
+ * Byte-fallback tokenizers cannot emit more tokens than input bytes.
+ */
+export function estimateTokenUpperBound(text: string): number {
+  return Buffer.byteLength(text, "utf8");
+}
+
+/** Safety-biased fallback for clients without a provider token counter. */
+export function estimateModelRequestTokens(request: ModelRequest): number {
+  return estimateTokenUpperBound(JSON.stringify({
+    systemPrompt: request.systemPrompt,
+    messages: request.messages,
+    tools: request.tools,
+  }));
 }
 
 export type ModelStreamEvent =

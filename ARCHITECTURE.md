@@ -15,13 +15,17 @@ ACP / channel/* ──► AgentRuntime
                          │
                          ▼
 provider/* ────────► AgentLoop ◄──────── SkillCatalog
+                         ▲
+runtime/* policy plans ─┘
                          │
-runtime/*  ◄─────────────┤
                          ▼
                       ToolRegistry ◄──── mcp.ts
                          │
                          ▼
                     SessionStore
+                         ▲
+                         │
+              storage/* config/lifecycle
 ```
 
 ## Boundaries
@@ -33,7 +37,11 @@ runtime/*  ◄─────────────┤
 - `channel/`: Normalize frontend events, forward streaming events, and send final output. Never store history.
 - `provider/`: Convert canonical messages to provider payloads and normalize provider responses.
 - `runtime/`: Streaming, cooperative cancellation, steering, retry, bounded tool execution, checkpoints,
-  and recovery.
+  and recovery. `ModelRequestPlanner`, `RunRecovery`, and `RunFinalizer` inspect detached snapshots and
+  return plans; they do not mutate a Session, save state, execute tools, or publish events.
+- `storage/`: Select and open managed PostgreSQL, Supabase, or SQLite Stores, validate/migrate the private
+  database schema, and own database-resource lifecycle. Supabase reuses the PostgreSQL engine through a
+  database connection; it is not implemented through the Data API.
 - `tools/`: Tool definitions and execution. Tools receive an immutable Session snapshot and AbortSignal;
   only trusted tools registered with write access receive the live Session through `mutableSession`.
   Write tools execute as exclusive barriers. `sessionAccess` describes only Session mutation; external
@@ -42,8 +50,10 @@ runtime/*  ◄─────────────┤
 - `mcp.ts`: Convert MCP tools into the same Tool interface used by local tools, apply host-owned trust and
   ordering policy, normalize failures, and own refresh/close lifecycle when using `MCPToolProvider`.
 - `session.ts`: Canonical messages and durable `RunState`/`ToolCallState`.
-- `agent-loop.ts`: The only core coordinator allowed to admit conversation and run-state mutations.
-  Trusted write tools mutate only while executing inside its exclusive tool barrier.
+- `agent-loop.ts`: The only core coordinator allowed to admit conversation and run-state mutations. It
+  applies policy plans and remains responsible for FIFO admission, live state, tool authorization,
+  checkpoints, and event ordering. Trusted write tools mutate only while executing inside its exclusive
+  tool barrier.
 
 Protocol adapters call `AgentRuntime`; they do not create alternative execution loops. Tool and Skill
 implementations are registered by the embedding host. A session or turn may select registered capability
@@ -55,8 +65,11 @@ consumer cannot mutate the source of truth through a boundary object.
 
 One runtime process hosts one independent agent. Multiple processes may run concurrently under an
 application-level orchestrator. They do not share in-memory queues or mutable sessions, and this project
-does not provide cluster membership, distributed scheduling, or cross-agent collaboration policy. Each
-process must have its own Store; cross-process sharing of one File or SQLite Store is unsupported.
+does not provide cluster membership, distributed scheduling, or cross-agent collaboration policy. A
+physical PostgreSQL database may serve several processes only when the application provides disjoint
+ownership: at most one process may own a given `(namespace, Session ID)` at a time. Database version checks
+do not provide cross-process FIFO ordering or exactly-once tool effects. Cross-process sharing of one File
+or SQLite file remains unsupported.
 
 ACP is the implemented client-to-agent protocol boundary. ACP-specific JSON-RPC and wire types remain in
 the adapter above `AgentRuntime`, not in canonical Session, Loop, Provider, Tool, or Skill models.
@@ -125,6 +138,62 @@ digests with stored-ID verification, and atomic rename within the supported sing
 IDs must be non-empty, well-formed Unicode. SQLite stores an explicit current Run ID rather than inferring
 it from wall-clock timestamps.
 
+## Database selection and lifecycle
+
+Managed persistence exposes three configuration profiles backed by two engines:
+
+```text
+PostgreSQL profile ──────────┐
+                              ├──► PostgreSQL SessionStore
+Supabase database profile ────┘
+SQLite profile ──────────────► SQLite SessionStore
+```
+
+Every declared profile must be complete and valid. `auto` selects the highest-priority declared profile in
+the fixed order PostgreSQL, Supabase, SQLite. Selection is a startup configuration decision, not failover:
+after a profile is selected, a readiness or connection failure fails startup and never falls through to
+another Store. Runtime failure also never changes the canonical Store. Explicit `mode` selects only the
+named profile. Resolution diagnostics omit credentials.
+
+PostgreSQL and Supabase share one transactional Store and use `(namespace, Session ID)` as the durable
+identity. Their tables live in the private `agent_runtime` schema, not `public`, and one checkpoint updates
+Session version, messages, current Run, and tool calls in one transaction. A Supabase profile accepts a
+PostgreSQL database URL (normally direct connection for a persistent backend, or session pooler when IPv4
+requires it); it does not use `supabase-js`, the REST/GraphQL Data API, or a browser key.
+
+Opening a PostgreSQL-backed Store checks the schema by default. Applying DDL is explicit through the
+migration API or a deployment step; migration credentials may be separate from runtime credentials.
+Migrations are ordered, checksummed, transactionally applied under a database lock, and reject an unknown
+future version or a changed applied migration. When migration and runtime roles differ, deployment also
+grants the runtime role `USAGE` on the private schema, `SELECT` on migration history for readiness, and DML
+on the four data tables. A Supabase deployment invokes this explicit migration from its deployment
+workflow; the runtime's migration history remains separate from Supabase's own migration table.
+
+The embedding host owns a managed Store. It calls `readinessCheck()` during startup as needed, closes
+`AgentRuntime` first so admitted work can drain, and only then calls `sessionStore.close()` to release the
+PostgreSQL pool or SQLite resource. Runtime close does not close an injected Store implicitly.
+
+## Loop policy plans
+
+Three extracted policy objects reduce `AgentLoop` size without creating alternative coordinators:
+
+- `ModelRequestPlanner` builds prompt/budget decisions and returns `ready`, `compress`, or `reject`. Provider
+  capability I/O, token estimation, compression-tool execution, and compression checkpoints remain in the
+  Loop.
+- `RunRecovery` reconciles a detached crashed-run snapshot and returns a no-op or recovery patch. It never
+  loads/saves a Store or replays a Tool.
+- `RunFinalizer` produces completed, failed, or cancelled terminal state plus save options and the terminal
+  event payload. It never checkpoints, publishes, or replaces the original error.
+
+`AgentLoop` validates the expected Run, applies each plan to the live Session, checkpoints it, and only then
+publishes the corresponding event. This preserves one mutation-admission path and keeps durable state ahead
+of observer-visible terminal outcomes. For tool batches it creates a private per-Run `RunMutationGate` that
+couples each admitted mutation to a serialized checkpoint. The internal coordinated executor receives this
+narrow gate instead of `SessionStore`; policy objects never receive either one. The deprecated exported
+`ToolExecutor` is a compatibility facade for its original direct-construction API and is not part of the
+Loop's mutation path. Trusted write tools may still access the live Session only within their exclusive
+Loop-authorized barrier.
+
 ## Safe recovery
 
 Each model/tool boundary is saved to `SessionStore`. Completed and failed tool outcomes are durable;
@@ -135,6 +204,15 @@ continue from a safe checkpoint, but the runtime does not promise exactly-once e
 Tool outcomes are normalized to JSON before being marked completed. Invalid or non-serializable outcomes
 become durable, model-visible failures instead of leaving an unpersistable completed checkpoint. Automatic
 conversation compression runs only when its Tool is active and preserves complete assistant/tool batches.
+Generated summaries are persisted as explicitly untrusted user-level data, never as system instructions;
+legacy system-role summaries are demoted before the next model request and rewritten durably.
+
+Before every model round, including rounds after tool results and steering, the Loop budgets the complete
+provider request: system and Skill prompts, messages and tool-call arguments, and Tool schemas. Packaged
+OpenRouter clients resolve the selected model's context window from OpenRouter model metadata and estimate
+their serialized wire payload. Other `ModelClient` implementations must expose `capabilities`/
+`getCapabilities`, or callers must configure `compressionThresholdTokens`, to enable token-based automatic
+compression; the Loop deliberately has no invented default context window for an unknown model.
 
 ## Event delivery
 

@@ -1,11 +1,55 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText, jsonSchema, streamText, tool, type LanguageModel } from "ai";
-import type { ModelClient, ModelRequest, ModelResponse, ModelStreamEvent, ToolCall } from "../model.js";
+import {
+  estimateModelRequestTokens,
+  estimateTokenUpperBound,
+  type ModelCapabilities,
+  type ModelClient,
+  type ModelRequest,
+  type ModelResponse,
+  type ModelStreamEvent,
+  type ToolCall,
+} from "../model.js";
 import type { Message } from "../session.js";
+import { toOpenAiCompatiblePayload } from "./openai-compatible-payload.js";
+import { OpenRouterCapabilitiesResolver } from "./openrouter-capabilities.js";
+
+export interface AiSdkModelClientOptions {
+  capabilities?: ModelCapabilities;
+  resolveCapabilities?: (signal?: AbortSignal) => Promise<ModelCapabilities | undefined>;
+  estimateRequestTokens?: (request: ModelRequest) => number | Promise<number>;
+}
 
 /** Keeps AI SDK provider and streaming details behind the runtime's ModelClient boundary. */
 export class AiSdkModelClient implements ModelClient {
-  constructor(readonly model: LanguageModel) {}
+  private resolvedCapabilities?: ModelCapabilities;
+
+  constructor(
+    readonly model: LanguageModel,
+    private readonly options: AiSdkModelClientOptions = {},
+  ) {
+    this.resolvedCapabilities = options.capabilities
+      ? Object.freeze({ ...options.capabilities })
+      : undefined;
+  }
+
+  get capabilities(): ModelCapabilities | undefined {
+    return this.resolvedCapabilities;
+  }
+
+  async getCapabilities(signal?: AbortSignal): Promise<ModelCapabilities | undefined> {
+    if (this.resolvedCapabilities?.contextWindowTokens !== undefined) {
+      return this.resolvedCapabilities;
+    }
+    const capabilities = await this.options.resolveCapabilities?.(signal);
+    if (capabilities) this.resolvedCapabilities = Object.freeze({ ...capabilities });
+    return capabilities ?? this.resolvedCapabilities;
+  }
+
+  estimateRequestTokens(request: ModelRequest): number | Promise<number> {
+    return this.options.estimateRequestTokens?.(request)
+      ?? estimateModelRequestTokens(request);
+  }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     const result = await generateText({
@@ -63,19 +107,49 @@ export interface AiSdkOpenRouterConfig {
   baseUrl?: string;
   appName?: string;
   httpReferer?: string;
+  fetch?: typeof fetch;
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
 }
 
 export function createAiSdkOpenRouterClient(config: AiSdkOpenRouterConfig): AiSdkModelClient {
+  const baseUrl = (config.baseUrl ?? "https://openrouter.ai/api/v1").replace(/\/$/, "");
+  const fetcher = config.fetch ?? fetch;
   const provider = createOpenAICompatible({
     name: "openrouter",
-    baseURL: config.baseUrl ?? "https://openrouter.ai/api/v1",
+    baseURL: baseUrl,
     apiKey: config.apiKey,
+    fetch: fetcher,
     headers: {
       "X-OpenRouter-Title": config.appName ?? "42 Agent",
       ...(config.httpReferer ? { "HTTP-Referer": config.httpReferer } : {}),
     },
   });
-  return new AiSdkModelClient(provider.chatModel(config.model));
+  const capabilities = new OpenRouterCapabilitiesResolver({
+    apiKey: config.apiKey,
+    model: config.model,
+    baseUrl,
+    fetch: fetcher,
+    contextWindowTokens: config.contextWindowTokens,
+    maxOutputTokens: config.maxOutputTokens,
+  });
+  return new AiSdkModelClient(provider.chatModel(config.model), {
+    capabilities: capabilities.capabilities,
+    resolveCapabilities: (signal) => capabilities.getCapabilities(signal),
+    estimateRequestTokens: (request) => estimateAiSdkOpenRouterRequestTokens(
+      config.model,
+      request,
+    ),
+  });
+}
+
+function estimateAiSdkOpenRouterRequestTokens(model: string, request: ModelRequest): number {
+  const payload = toOpenAiCompatiblePayload(model, request, true);
+  if (request.tools.length > 0) {
+    return estimateTokenUpperBound(JSON.stringify({ ...payload, tool_choice: "auto" }));
+  }
+  const { tools: _tools, ...withoutEmptyTools } = payload;
+  return estimateTokenUpperBound(JSON.stringify(withoutEmptyTools));
 }
 
 function toAiTools(request: ModelRequest): Record<string, ReturnType<typeof tool>> {

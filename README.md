@@ -20,8 +20,9 @@ the sessions assigned to that process:
 The runtime is deliberately a single-process building block. A production application may launch many
 42 Agent processes and run them in parallel. Those agents remain independent: they do not share an
 in-memory queue, do not coordinate through a common `SessionStore`, and do not require distributed locks.
-Provision a distinct Store for each process; sharing one File or SQLite Store across runtimes is outside
-the supported process model.
+Give every process its own File/SQLite Store. Several processes may use one physical PostgreSQL database
+only when the application keeps ownership disjoint; at most one process may own a given
+`(namespace, session ID)` at a time.
 
 The application above the runtime is responsible for agent discovery, task decomposition, scheduling,
 result routing, collaboration policy, identity, tenancy, and deployment. If agent A's output becomes agent
@@ -146,7 +147,10 @@ channel C ─┘
 - steering at model/tool barriers
 - durable checkpoints at model and tool boundaries
 - conservative crash reconciliation: uncertain side effects are never replayed automatically
-- update-only, version-checked in-memory, file, and SQLite session stores
+- update-only, version-checked in-memory, file, SQLite, and PostgreSQL session stores; Supabase reuses the
+  PostgreSQL engine
+- managed database startup selection with PostgreSQL > Supabase > SQLite priority and no failure fallback
+- pure model-request, recovery, and finalization policy plans applied and checkpointed only by `AgentLoop`
 - per-session FIFO turns and recovery while different sessions remain concurrent
 - well-formed Unicode Session IDs with collision-checked, fixed-length File Store paths
 
@@ -155,9 +159,15 @@ channel C ─┘
 `AgentRuntime` is the only protocol-facing lifecycle facade. It derives the Store, Tool registry, and Skill
 loader from `AgentLoop`, so validation, execution, close, and recovery cannot be wired to different sources
 of truth.
-`AgentLoop` owns the per-session FIFO coordinator and `SessionStore` is the persistence boundary. Channels
-normalize transport input and project best-effort events; providers normalize model APIs; tools execute
-capabilities. See [ARCHITECTURE.md](./ARCHITECTURE.md) for boundaries and recovery semantics.
+`AgentLoop` owns the per-session FIFO coordinator and remains the only core mutation coordinator.
+`ModelRequestPlanner`, `RunRecovery`, and `RunFinalizer` only return plans; the Loop applies them, saves the
+result, and orders events. Its internal coordinated Tool executor receives only a private per-Run mutation
+gate, which serializes admitted mutations with their checkpoints. The exported `ToolExecutor` retains its
+old direct-construction API as a deprecated compatibility facade and is not used by `AgentLoop`.
+`SessionStore` is the persistence boundary.
+Channels normalize transport input and project best-effort events; providers normalize model APIs; tools
+execute capabilities. See
+[ARCHITECTURE.md](./ARCHITECTURE.md) for boundaries, storage selection, and recovery semantics.
 
 ## Quick start
 
@@ -182,17 +192,126 @@ npm run check
 functions across `dist/src`. GitHub Actions runs lint, type-checking, coverage gates, and
 `npm pack --dry-run` on Node.js 22.13, 24, and 26.
 
-The package exposes `dist/src/index.js` and its declarations, plus `42-agent/acp` for the ACP adapter.
+The package exposes `dist/src/index.js` and its declarations, plus `42-agent/acp` for the ACP adapter and
+`42-agent/storage` for managed database Stores.
 It is licensed under [Apache-2.0](./LICENSE) and configured for public npm publication. Public releases
 use semantic versions and remain an explicit maintainer action; `npm pack --dry-run` verifies package
 contents without publishing them.
+
+## Managed database storage
+
+`openSessionStore` accepts PostgreSQL, Supabase, and SQLite configuration profiles backed by two physical
+engines. In the default `auto` mode it selects PostgreSQL first, then Supabase, then SQLite:
+
+```ts
+import { resolve } from "node:path";
+import {
+  migratePostgresSchema,
+  openSessionStore,
+  resolveSessionDatabaseConfig,
+  type SessionDatabaseConfig,
+} from "42-agent/storage";
+
+const storageConfig: SessionDatabaseConfig = {
+  namespace: "orders-agent",
+  ...(process.env.AGENT_POSTGRES_URL
+    ? { postgres: { connectionString: process.env.AGENT_POSTGRES_URL } }
+    : {}),
+  ...(process.env.SUPABASE_DATABASE_URL
+    ? {
+        supabase: {
+          databaseUrl: process.env.SUPABASE_DATABASE_URL,
+          // Use only for an intentionally plaintext local/self-hosted database.
+          ...(process.env.SUPABASE_DATABASE_SSL === "false" ? { ssl: false } : {}),
+        },
+      }
+    : {}),
+  sqlite: { filename: resolve(".agent-data/runtime.sqlite") },
+};
+
+// Safe to log: credentials are deliberately omitted.
+console.log(resolveSessionDatabaseConfig(storageConfig));
+const sessionStore = await openSessionStore(storageConfig);
+```
+
+Every declared profile is validated before selection, so a partial profile is a configuration error. Once
+selected, connection or readiness failure fails startup; it never falls through to another profile, and
+the Runtime never switches its canonical Store. Explicit `mode: "postgres" | "supabase" | "sqlite"`
+selects only that profile. Adding a remote profile does not migrate existing SQLite data.
+
+Supabase uses its PostgreSQL `databaseUrl`, not `supabase-js`, a Data API key, or the REST/GraphQL API. For
+this persistent Node runtime, use a [direct database connection or the session pooler when IPv4 requires
+it](https://supabase.com/docs/guides/database/connecting-to-postgres). PostgreSQL and Supabase data live in
+the private `agent_runtime` schema and are keyed by `(namespace, session ID)`; the application must ensure
+that no two processes own the same pair concurrently.
+
+For each Supabase `databaseUrl` and `migrationUrl`, TLS defaults to `ssl: true` when that URL contains no
+PostgreSQL TLS parameter (`ssl`, `sslmode`, `sslcert`, `sslkey`, `sslrootcert`, or `sslnegotiation`). If a
+URL contains one of those parameters, the library leaves TLS parsing to `pg` for that connection. An
+explicit profile-level `ssl` setting cannot be combined with TLS parameters in either URL. Set
+`ssl: false` only for an intentionally plaintext local or self-hosted database; never disable TLS for
+hosted Supabase. The safe resolution diagnostic includes `ssl` when the library selected it and omits the
+field when the URL controls TLS.
+
+PostgreSQL-backed startup defaults to `schemaMode: "check"`. Apply DDL explicitly in a deployment step
+with `migratePostgresSchema(...)`, or opt a profile into `schemaMode: "migrate"`; an optional
+`migrationConnectionString`/`migrationUrl` can keep elevated migration credentials separate from runtime
+credentials. Put that explicit invocation in the deployment pipeline; Supabase documents its [database
+migration workflow](https://supabase.com/docs/guides/deployment/database-migrations). `openSessionStore`
+performs its readiness check before returning.
+
+The standalone migration API is profile-aware, so Supabase retains the same secure TLS default:
+
+```ts
+await migratePostgresSchema({
+  profile: "supabase",
+  databaseUrl: process.env.SUPABASE_MIGRATION_URL
+    ?? process.env.SUPABASE_DATABASE_URL!,
+});
+
+// A regular PostgreSQL deployment uses the connection string's TLS policy.
+await migratePostgresSchema({
+  profile: "postgres",
+  connectionString: process.env.POSTGRES_MIGRATION_URL!,
+});
+```
+
+If migration and runtime connections use different database roles, the deployment must also grant the
+runtime role access to the private schema and data tables; the library does not infer or create that role.
+For example, run the following as the schema owner after migrations, replacing `agent_runtime_user` with
+the runtime role (and repeat grants when a later migration adds tables):
+
+```sql
+GRANT USAGE ON SCHEMA agent_runtime TO agent_runtime_user;
+GRANT SELECT ON agent_runtime.schema_migrations TO agent_runtime_user;
+GRANT SELECT, INSERT, UPDATE, DELETE
+  ON agent_runtime.sessions, agent_runtime.messages,
+     agent_runtime.runs, agent_runtime.tool_calls
+  TO agent_runtime_user;
+```
+
+The embedding host owns the managed Store. Close the Runtime first so admitted work finishes, then release
+the Store's database resources:
+
+```ts
+await server.close();       // Stop request admission.
+await runtime.close();      // Drain admitted work.
+await sessionStore.close(); // Release the pool/database.
+```
 
 To run the OpenRouter-backed HTTP runtime:
 
 ```bash
 export OPENROUTER_API_KEY=...
+# Optional. PostgreSQL wins if both remote URLs are set.
+export AGENT_POSTGRES_URL=postgresql://...
+# Or: export SUPABASE_DATABASE_URL=postgresql://...
+# For an explicit first migration: export AGENT_DATABASE_SCHEMA_MODE=migrate
 npm run runtime
 ```
+
+With neither remote URL set, the example uses the configured SQLite file. Its complete environment mapping
+and signal-safe shutdown order are in [`examples/runtime-server.ts`](./examples/runtime-server.ts).
 
 The HTTP server is a trusted development adapter, not a production ingress: it has no authentication,
 binds to loopback by default, rejects browser origins unless an exact `allowedOrigin` is configured,
@@ -215,7 +334,8 @@ Another channel that resolves to `shared-session` will continue the same canonic
 - A request cancelled before its FIFO admission does not create a Run or append a user message.
 - Steering and cancellation admission close at the Turn's terminal barrier; control messages cannot leak
   into the next Turn.
-- Separate runtime processes are independent and may execute concurrently without sharing session state.
+- Separate runtime processes are independent and may execute concurrently. They must not concurrently own
+  the same namespaced Session even when their Stores use one physical PostgreSQL database.
 - Cancellation stops new tool dispatch and does not settle until every already-started tool has settled.
 - Repeated or re-entrant Runtime/Session close calls join the same shutdown operation; close gates new work,
   waits for admitted reads, recovery, Turns, and tools, then deletes Session state where requested.
@@ -281,6 +401,7 @@ src/acp/                official-SDK ACP v1 adapter, permission bridge, update p
 src/channel/            reusable channel adapters
 src/tools/              local tools
 src/mcp.ts              MCP tool policy, result normalization, refresh and lifecycle
+src/storage/            managed database selection, migrations, and Store lifecycle
 src/session*.ts         session contracts and stores
 examples/               minimal and HTTP runtime examples
 tests/                  runtime and integration tests

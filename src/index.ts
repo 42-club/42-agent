@@ -12,6 +12,7 @@ export * from "./session-file.js";
 export * from "./session-sqlite.js";
 export * from "./service/index.js";
 export * from "./skills.js";
+export * from "./storage/index.js";
 export * from "./tools/base.js";
 export * from "./tools/bash.js";
 export * from "./tools/compression.js";
