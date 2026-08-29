@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { OpenRouterModelClient, type ModelRequest, type ModelStreamEvent } from "../src/index.js";
+import {
+  OpenRouterModelClient,
+  estimateTokenUpperBound,
+  type ModelRequest,
+  type ModelStreamEvent,
+} from "../src/index.js";
 
 const request: ModelRequest = {
   systemPrompt: "system", messages: [{ role: "user", content: "hello" }],
@@ -17,6 +22,120 @@ test("OpenRouter defaults to Opus 4.6 and normalizes tool calls", async () => {
   assert.equal(payload.model, "anthropic/claude-opus-4.6");
   assert.equal(payload.messages[0].role, "system");
   assert.deepEqual(response.toolCalls?.[0]?.arguments, { q: "x" });
+});
+
+test("OpenRouter resolves and caches the selected model's real limits", async () => {
+  const urls: string[] = [];
+  const client = new OpenRouterModelClient({
+    apiKey: "test-key",
+    model: "vendor/model:free",
+    baseUrl: "https://router.invalid/api/v1/",
+    fetch: async (input) => {
+      urls.push(String(input));
+      return Response.json({
+        data: {
+          context_length: 32_768,
+          top_provider: { max_completion_tokens: 8_192 },
+        },
+      });
+    },
+  });
+
+  assert.equal(client.capabilities, undefined);
+  assert.deepEqual(await client.getCapabilities(), {
+    contextWindowTokens: 32_768,
+    maxOutputTokens: 8_192,
+  });
+  assert.deepEqual(await client.getCapabilities(), {
+    contextWindowTokens: 32_768,
+    maxOutputTokens: 8_192,
+  });
+  assert.deepEqual(client.capabilities, {
+    contextWindowTokens: 32_768,
+    maxOutputTokens: 8_192,
+  });
+  assert.deepEqual(urls, ["https://router.invalid/api/v1/model/vendor/model%3Afree"]);
+});
+
+test("explicit OpenRouter limits skip model metadata lookup", async () => {
+  let fetches = 0;
+  const client = new OpenRouterModelClient({
+    apiKey: "test-key",
+    contextWindowTokens: 16_384,
+    maxOutputTokens: 4_096,
+    fetch: async () => {
+      fetches += 1;
+      throw new Error("metadata lookup should be skipped");
+    },
+  });
+
+  assert.deepEqual(await client.getCapabilities(), {
+    contextWindowTokens: 16_384,
+    maxOutputTokens: 4_096,
+  });
+  assert.equal(fetches, 0);
+});
+
+test("cancelled OpenRouter metadata is not cached and can be retried", async () => {
+  const controller = new AbortController();
+  const reason = new DOMException("cancel metadata", "AbortError");
+  let fetches = 0;
+  const client = new OpenRouterModelClient({
+    apiKey: "test-key",
+    model: "test/model",
+    fetch: async () => {
+      fetches += 1;
+      if (fetches === 1) controller.abort(reason);
+      return Response.json({ data: { context_length: 8_192 } });
+    },
+  });
+
+  await assert.rejects(client.getCapabilities(controller.signal), reason);
+  assert.deepEqual(await client.getCapabilities(), { contextWindowTokens: 8_192 });
+  assert.equal(fetches, 2);
+});
+
+test("OpenRouter rejects inconsistent configured model limits", () => {
+  assert.throws(() => new OpenRouterModelClient({
+    apiKey: "test-key",
+    contextWindowTokens: 4_096,
+    maxOutputTokens: 8_192,
+  }), /maxOutputTokens cannot exceed contextWindowTokens/);
+});
+
+test("OpenRouter estimates the same serialized payload that it sends", async () => {
+  let payload: unknown;
+  const client = new OpenRouterModelClient({
+    apiKey: "test-key",
+    contextWindowTokens: 10_000,
+    fetch: async (_input, init) => {
+      payload = JSON.parse(String(init?.body));
+      return Response.json({ choices: [{ message: { content: "done" } }] });
+    },
+  });
+  const toolRequest: ModelRequest = {
+    systemPrompt: "系统规则",
+    messages: [
+      { role: "user", content: "go" },
+      {
+        role: "assistant",
+        content: "",
+        metadata: {
+          toolCalls: [{ id: "call-1", name: "lookup", arguments: { q: "参数".repeat(20) } }],
+        },
+      },
+      { role: "tool", name: "lookup", toolCallId: "call-1", content: '{"value":1}' },
+    ],
+    tools: [{
+      name: "lookup",
+      description: "lookup values",
+      inputSchema: { type: "object", properties: { q: { type: "string" } } },
+    }],
+  };
+  const estimate = client.estimateRequestTokens(toolRequest);
+
+  await client.complete(toolRequest);
+  assert.equal(estimate, estimateTokenUpperBound(JSON.stringify(payload)));
 });
 
 test("OpenRouter streaming assembles fragmented tool calls", async () => {

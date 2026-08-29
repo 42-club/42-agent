@@ -1,25 +1,39 @@
 import { randomUUID } from "node:crypto";
 import {
-  estimateTokens,
+  estimateModelRequestTokens,
   supportsModelStreaming,
   type ModelClient,
+  type ModelRequest,
   type ToolCall,
 } from "./model.js";
-import { buildSystemPrompt } from "./prompt.js";
 import {
   EventDispatcher,
   type AgentLoopEvent,
   type AgentLoopEventHandler,
 } from "./runtime/events.js";
+import {
+  ModelRequestPlanner,
+  type ModelBudget,
+  type PreviousCompressionSnapshot,
+} from "./runtime/model-request-planner.js";
 import { ModelRunner } from "./runtime/model-runner.js";
 import { RetryPolicy, type RetryPolicyOptions, throwIfAborted } from "./runtime/retry.js";
 import { normalizeRuntimeError } from "./runtime/errors.js";
+import { RunFinalizer } from "./runtime/run-finalizer.js";
+import { RunRecovery, type RecoveryResult } from "./runtime/run-recovery.js";
 import { SteeringQueue } from "./runtime/steering.js";
-import { ToolExecutor } from "./runtime/tool-executor.js";
-import { createMessage, type RunState, type Session, type SessionStore } from "./session.js";
+import { CoordinatedToolExecutor } from "./runtime/tool-executor.js";
+import {
+  createMessage,
+  type RunState,
+  type SaveSessionOptions,
+  type Session,
+  type SessionStore,
+} from "./session.js";
 import type { SkillLoader } from "./skills.js";
 import type { ApprovalHandler } from "./tools/base.js";
 import { ToolRegistry } from "./tools/base.js";
+import { demoteLegacyConversationSummaries } from "./tools/compression.js";
 
 export interface AgentLoopConfig {
   compressionThreshold?: number;
@@ -45,16 +59,21 @@ export interface TurnExecutionResult {
   stopReason: "end_turn";
 }
 
-export interface RecoveryResult {
-  recovered: boolean;
-  interruptedToolCalls: number;
+export type { RecoveryResult } from "./runtime/run-recovery.js";
+
+interface RunMutationGate {
+  readonly checkpoint: (
+    mutate?: () => void,
+    options?: SaveSessionOptions,
+  ) => Promise<void>;
 }
 
 export class AgentLoop {
-  private readonly compressionThreshold: number;
-  private readonly compressionThresholdTokens: number;
   private readonly maxToolRounds: number;
   private readonly retry: RetryPolicy;
+  private readonly modelRequestPlanner: ModelRequestPlanner;
+  private readonly runRecovery = new RunRecovery();
+  private readonly runFinalizer = new RunFinalizer();
   private readonly steering = new SteeringQueue();
   private readonly sessionTails = new Map<string, Promise<void>>();
 
@@ -69,9 +88,7 @@ export class AgentLoop {
       config?: AgentLoopConfig;
     },
   ) {
-    this.compressionThreshold = dependencies.config?.compressionThreshold ?? 100;
-    const contextWindow = dependencies.model.capabilities?.contextWindowTokens ?? 128_000;
-    this.compressionThresholdTokens = dependencies.config?.compressionThresholdTokens ?? Math.floor(contextWindow * 0.65);
+    this.modelRequestPlanner = new ModelRequestPlanner(dependencies.config);
     this.maxToolRounds = dependencies.config?.maxToolRounds ?? 16;
     this.retry = new RetryPolicy(dependencies.config?.retry);
   }
@@ -110,18 +127,21 @@ export class AgentLoop {
 
   private async recoverSessionSerialized(sessionId: string): Promise<RecoveryResult> {
     const session = await this.dependencies.sessionStore.get(sessionId);
-    if (!session) return { recovered: false, interruptedToolCalls: 0 };
-    const state = session.runState;
-    if (!state || state.status !== "running") {
-      return { recovered: false, interruptedToolCalls: 0 };
-    }
+    const plan = this.runRecovery.plan(immutableSnapshot({
+      session,
+      now: new Date().toISOString(),
+    }));
+    if (plan.kind === "noop") return plan.result;
+    if (!session) throw new Error("Recovery plan requires an existing Session");
 
-    const interruptedToolCalls = reconcileToolCallMessages(session, state);
-    state.status = "interrupted";
-    state.phase = "idle";
-    state.updatedAt = new Date().toISOString();
+    this.applyRunStatePlan(
+      session,
+      plan.expectedRunId,
+      plan.nextRunState,
+      plan.appendMessages,
+    );
     await this.dependencies.sessionStore.save(session);
-    return { recovered: true, interruptedToolCalls };
+    return plan.result;
   }
 
   async runTurn(input: RunTurnInput): Promise<string> {
@@ -144,6 +164,7 @@ export class AgentLoop {
       : this.dependencies.tools;
     await this.recoverSessionSerialized(input.sessionId);
     const session = await this.dependencies.sessionStore.getOrCreate(input.sessionId);
+    const rewroteLegacySummaries = demoteLegacyConversationSummaries(session.messages);
     const runState = createRunState();
     session.runState = runState;
     session.messages.push(createMessage({ role: "user", content: input.userInput }));
@@ -157,9 +178,9 @@ export class AgentLoop {
       notifyObserver(this.dependencies.onEvent, event);
     });
     const modelRunner = new ModelRunner(this.dependencies.model, this.retry);
-    const toolExecutor = new ToolExecutor(
+    const toolExecutor = new CoordinatedToolExecutor(
       activeTools,
-      this.dependencies.sessionStore,
+      this.createRunMutationGate(session),
       events,
     );
     const toolContext = {
@@ -168,32 +189,24 @@ export class AgentLoop {
       signal: input.signal,
     };
 
-    await this.dependencies.sessionStore.save(session);
+    await this.dependencies.sessionStore.save(session, {
+      rewriteMessages: rewroteLegacySummaries,
+    });
     this.steering.begin(session.id, runState.id);
     await events.emit({ type: "run_started", sessionId: session.id, runId: runState.id });
 
     try {
       throwIfAborted(input.signal);
-      const estimatedHistoryTokens = session.messages.reduce((sum, message) => sum + estimateTokens(message.content) + 4, 0);
-      // compressionThreshold remains as a backwards-compatible explicit override.
-      const shouldCompress = estimatedHistoryTokens >= this.compressionThresholdTokens
-        || (this.dependencies.config?.compressionThreshold !== undefined
-          && session.messages.length >= this.compressionThreshold);
-      if (shouldCompress && activeTools.has("compress_conversation")) {
-        const compression = activeTools.get("compress_conversation");
-        activeTools.validate(compression.name, {});
-        const result = await compression.execute(
-          {},
-          activeTools.contextFor(compression, toolContext),
-        ) as { compressed?: boolean };
-        await this.dependencies.sessionStore.save(session, {
-          rewriteMessages: result.compressed === true,
-        });
-      }
-
       const systemPrompt = await this.resolveSystemPrompt(input);
       for (let round = 0; round < this.maxToolRounds; round += 1) {
         throwIfAborted(input.signal);
+        const modelRequest = await this.prepareModelRequest(
+          session,
+          activeTools,
+          toolContext,
+          systemPrompt,
+          input.signal,
+        );
         runState.round = round;
         runState.phase = "model";
         touch(runState);
@@ -206,12 +219,7 @@ export class AgentLoop {
         });
 
         const response = await modelRunner.run(
-          {
-            messages: immutableSnapshot(session.messages),
-            tools: immutableSnapshot(activeTools.definitions()),
-            systemPrompt,
-            signal: input.signal,
-          },
+          modelRequest,
           {
             onTextDelta: (delta) =>
               events.emit({
@@ -249,19 +257,23 @@ export class AgentLoop {
         if (steeringCount > 0) continue;
         throwIfAborted(input.signal);
 
-        runState.status = "completed";
-        runState.phase = "idle";
-        touch(runState);
-        await this.dependencies.sessionStore.save(session);
-        await events.emit({
-          type: "run_completed",
-          sessionId: session.id,
-          runId: runState.id,
+        const plan = this.runFinalizer.plan(immutableSnapshot({
+          kind: "completed" as const,
+          session,
           content,
-        });
+          now: new Date().toISOString(),
+        }));
+        this.applyRunStatePlan(
+          session,
+          plan.expectedRunId,
+          plan.nextRunState,
+          plan.appendMessages,
+        );
+        await this.dependencies.sessionStore.save(session, plan.saveOptions);
+        await events.emit(plan.event);
         return {
           sessionId: session.id,
-          runId: runState.id,
+          runId: plan.expectedRunId,
           content,
           stopReason: "end_turn",
         };
@@ -273,22 +285,22 @@ export class AgentLoop {
       // A checkpoint can fail after the assistant tool-call message or a live
       // call-state mutation. Always close that protocol batch before persisting
       // the terminal Run so the next model request never sees orphaned calls.
-      reconcileToolCallMessages(session, runState);
-      runState.status = cancelled ? "cancelled" : "failed";
-      runState.phase = "idle";
-      runState.error = error instanceof Error ? error.message : String(error);
-      touch(runState);
-      await this.dependencies.sessionStore.save(session, { rewriteMessages: true });
-      if (cancelled) {
-        await events.emit({ type: "run_cancelled", sessionId: session.id, runId: runState.id });
-      } else {
-        await events.emit({
-          type: "run_failed",
-          sessionId: session.id,
-          runId: runState.id,
-          error: normalizeRuntimeError(error),
-        });
-      }
+      const plan = this.runFinalizer.plan(immutableSnapshot({
+        kind: "failed" as const,
+        session,
+        cancelled,
+        errorMessage: error instanceof Error ? error.message : String(error),
+        error: normalizeRuntimeError(error),
+        now: new Date().toISOString(),
+      }));
+      this.applyRunStatePlan(
+        session,
+        plan.expectedRunId,
+        plan.nextRunState,
+        plan.appendMessages,
+      );
+      await this.dependencies.sessionStore.save(session, plan.saveOptions);
+      await events.emit(plan.event);
       throw error;
     }
   }
@@ -309,13 +321,118 @@ export class AgentLoop {
   }
 
   private async resolveSystemPrompt(input: RunTurnInput): Promise<string> {
-    const skillPrompts: string[] = [];
+    const skillInstructions: string[] = [];
     if (input.skills?.length) {
       if (!this.dependencies.skillLoader) throw new Error("No SkillLoader configured");
       const loaded = await this.dependencies.skillLoader.load(input.skills);
-      skillPrompts.push(...loaded.map((skill) => skill.instructions));
+      skillInstructions.push(...loaded.map((skill) => skill.instructions));
     }
-    return buildSystemPrompt([...(input.promptInjections ?? []), ...skillPrompts]);
+    return this.modelRequestPlanner.buildPrompt(immutableSnapshot({
+      promptInjections: input.promptInjections ?? [],
+      skillInstructions,
+    }));
+  }
+
+  private async prepareModelRequest(
+    session: Session,
+    activeTools: ToolRegistry,
+    toolContext: {
+      session: Session;
+      requestApproval: ApprovalHandler;
+      signal?: AbortSignal;
+    },
+    systemPrompt: string,
+    signal?: AbortSignal,
+  ): Promise<ModelRequest> {
+    let request = this.createModelRequestSnapshot(session, activeTools, systemPrompt, signal);
+    const budget = await this.resolveModelBudget(signal);
+    throwIfAborted(signal);
+    let compressionPasses = 0;
+    let previousCompression: PreviousCompressionSnapshot | undefined;
+    for (;;) {
+      const estimatedTokens = this.modelRequestPlanner.needsTokenEstimate(budget)
+        ? await this.estimateRequestTokens(request)
+        : undefined;
+      throwIfAborted(signal);
+      const decision = this.modelRequestPlanner.plan(Object.freeze({
+        request,
+        budget,
+        estimatedTokens,
+        compressionAvailable: activeTools.has("compress_conversation"),
+        compressionPasses,
+        previousCompression: previousCompression
+          ? Object.freeze({ ...previousCompression })
+          : undefined,
+      }));
+      if (decision.kind === "ready") return decision.request;
+      if (decision.kind === "reject") throw decision.error;
+
+      const compressed = await this.compressConversation(activeTools, toolContext);
+      compressionPasses += 1;
+      throwIfAborted(signal);
+      previousCompression = {
+        compressed,
+        messageCount: decision.baseline.messageCount,
+        estimatedTokens: decision.baseline.estimatedTokens,
+      };
+      request = this.createModelRequestSnapshot(
+        session,
+        activeTools,
+        systemPrompt,
+        signal,
+      );
+    }
+  }
+
+  private async compressConversation(
+    activeTools: ToolRegistry,
+    toolContext: {
+      session: Session;
+      requestApproval: ApprovalHandler;
+      signal?: AbortSignal;
+    },
+  ): Promise<boolean> {
+    const compression = activeTools.get("compress_conversation");
+    activeTools.validate(compression.name, {});
+    const result = await compression.execute(
+      {},
+      activeTools.contextFor(compression, toolContext),
+    ) as { compressed?: boolean };
+    await this.dependencies.sessionStore.save(toolContext.session, {
+      rewriteMessages: result.compressed === true,
+    });
+    return result.compressed === true;
+  }
+
+  private async resolveModelBudget(signal?: AbortSignal): Promise<ModelBudget> {
+    const resolved = await this.dependencies.model.getCapabilities?.(signal);
+    throwIfAborted(signal);
+    return this.modelRequestPlanner.resolveBudget(immutableSnapshot({
+      resolved,
+      configured: this.dependencies.model.capabilities,
+    }));
+  }
+
+  private async estimateRequestTokens(request: ModelRequest): Promise<number> {
+    const estimate = await (
+      this.dependencies.model.estimateRequestTokens?.(request)
+      ?? estimateModelRequestTokens(request)
+    );
+    return this.modelRequestPlanner.normalizeTokenEstimate(estimate);
+  }
+
+  private createModelRequestSnapshot(
+    session: Session,
+    activeTools: ToolRegistry,
+    systemPrompt: string,
+    signal?: AbortSignal,
+  ): ModelRequest {
+    return this.modelRequestPlanner.createRequest({
+      messages: immutableSnapshot(session.messages),
+      tools: immutableSnapshot(activeTools.definitions()),
+      systemPrompt,
+      signal,
+    });
   }
 
   private async applySteering(
@@ -347,6 +464,37 @@ export class AgentLoop {
     }
     return messages.length;
   }
+
+  private applyRunStatePlan(
+    session: Session,
+    expectedRunId: string,
+    nextRunState: RunState,
+    appendMessages: readonly Session["messages"][number][],
+  ): void {
+    if (session.runState?.id !== expectedRunId) {
+      throw new Error(`Run changed while applying policy plan: ${expectedRunId}`);
+    }
+    session.runState = structuredClone(nextRunState);
+    session.messages.push(...structuredClone(appendMessages));
+  }
+
+  private createRunMutationGate(session: Session): RunMutationGate {
+    let persistenceTail: Promise<void> = Promise.resolve();
+    const checkpoint = async (
+      mutate?: () => void,
+      options?: SaveSessionOptions,
+    ): Promise<void> => {
+      const pending = persistenceTail
+        .catch(() => undefined)
+        .then(async () => {
+          mutate?.();
+          await this.dependencies.sessionStore.save(session, options);
+        });
+      persistenceTail = pending.catch(() => undefined);
+      await pending;
+    };
+    return Object.freeze({ checkpoint });
+  }
 }
 
 function createRunState(): RunState {
@@ -368,67 +516,6 @@ function touch(state: RunState): void {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
-}
-
-function serializeToolResult(result: unknown): string {
-  return JSON.stringify(result) ?? "null";
-}
-
-function reconcileToolCallMessages(session: Session, state: RunState): number {
-  const runToolCallIds = new Set(state.toolCalls.map((call) => call.id));
-  const batchStartByCall = new Map<string, number>();
-  for (let index = 0; index < session.messages.length; index += 1) {
-    const message = session.messages[index]!;
-    if (message.role !== "assistant" || !Array.isArray(message.metadata?.toolCalls)) continue;
-    for (const item of message.metadata.toolCalls) {
-      if (typeof item !== "object" || item === null) continue;
-      const callId = String((item as { id?: unknown }).id);
-      if (runToolCallIds.has(callId)) batchStartByCall.set(callId, index);
-    }
-  }
-
-  const recordedToolCalls = new Set<string>();
-  for (const call of state.toolCalls) {
-    const batchStart = batchStartByCall.get(call.id);
-    if (batchStart === undefined) continue;
-    for (let index = batchStart + 1; index < session.messages.length; index += 1) {
-      const message = session.messages[index]!;
-      if (message.role === "assistant") break;
-      if (message.role === "tool" && message.toolCallId === call.id) {
-        recordedToolCalls.add(call.id);
-        break;
-      }
-    }
-  }
-
-  let interrupted = 0;
-  for (const call of state.toolCalls) {
-    let result: unknown;
-    if (call.status === "completed") {
-      result = call.result;
-    } else if (call.status === "failed") {
-      result = { error: "ToolExecutionError", message: call.error ?? "Tool execution failed" };
-    } else {
-      if (call.status === "running" || call.status === "pending") {
-        call.status = "interrupted";
-        call.error = "Execution interrupted before a durable result was recorded";
-        interrupted += 1;
-      }
-      result = {
-        error: "InterruptedToolCall",
-        message: "工具执行状态未知，未自动重试，需由后续运行重新判断。",
-      };
-    }
-    if (recordedToolCalls.has(call.id) || !batchStartByCall.has(call.id)) continue;
-    session.messages.push(createMessage({
-      role: "tool",
-      name: call.name,
-      toolCallId: call.id,
-      content: serializeToolResult(result),
-    }));
-    recordedToolCalls.add(call.id);
-  }
-  return interrupted;
 }
 
 function snapshotRunTurnInput(input: RunTurnInput): RunTurnInput {

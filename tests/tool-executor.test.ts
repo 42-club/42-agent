@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  AgentLoop, ConversationCompressionTool, InMemorySessionStore, ToolRegistry,
+  AgentLoop, ConversationCompressionTool, EventDispatcher, InMemorySessionStore,
+  ToolExecutor, ToolRegistry,
   createMessage, type ModelClient, type SaveSessionOptions, type Session,
-  type SessionStore, type Tool,
+  type RunState, type SessionStore, type Tool,
 } from "../src/index.js";
 
 class FailOneSaveStore implements SessionStore {
@@ -26,6 +27,69 @@ class FailOneSaveStore implements SessionStore {
     return this.base.save(session, options);
   }
 }
+
+class ConcurrentSaveProbeStore implements SessionStore {
+  private activeSaves = 0;
+  maximumActiveSaves = 0;
+
+  constructor(private readonly base: SessionStore) {}
+
+  get(sessionId: string) { return this.base.get(sessionId); }
+  create(sessionId: string, metadata?: Record<string, unknown>) {
+    return this.base.create(sessionId, metadata);
+  }
+  getOrCreate(sessionId: string) { return this.base.getOrCreate(sessionId); }
+  delete(sessionId: string) { return this.base.delete(sessionId); }
+  async save(session: Session, options?: SaveSessionOptions): Promise<void> {
+    this.activeSaves += 1;
+    this.maximumActiveSaves = Math.max(this.maximumActiveSaves, this.activeSaves);
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await this.base.save(session, options);
+    } finally {
+      this.activeSaves -= 1;
+    }
+  }
+}
+
+test("legacy ToolExecutor constructor remains compatible", async () => {
+  const store = new InMemorySessionStore();
+  const session = await store.create("legacy-tool-executor");
+  const tools = new ToolRegistry();
+  tools.register({
+    name: "echo",
+    description: "Echo a value",
+    inputSchema: {
+      type: "object",
+      properties: { value: { type: "string" } },
+      required: ["value"],
+      additionalProperties: false,
+    },
+    async execute(input) {
+      return { value: input.value };
+    },
+  });
+  const runState: RunState = {
+    id: "legacy-run",
+    status: "running",
+    phase: "idle",
+    round: 0,
+    startedAt: "2026-08-29T00:00:00.000Z",
+    updatedAt: "2026-08-29T00:00:00.000Z",
+    toolCalls: [],
+  };
+  const executor = new ToolExecutor(tools, store, new EventDispatcher());
+
+  await executor.executeAll(
+    [{ id: "legacy-call", name: "echo", arguments: { value: "ok" } }],
+    { session, requestApproval: async () => false },
+    runState,
+  );
+
+  assert.equal(runState.toolCalls[0]?.status, "completed");
+  assert.deepEqual(JSON.parse(session.messages[0]?.content ?? "null"), { value: "ok" });
+  assert.equal((await store.get(session.id))?.messages[0]?.toolCallId, "legacy-call");
+});
 
 test("one tool batch runs concurrently and returns results in call order", async () => {
   let modelCalls = 0;
@@ -572,4 +636,39 @@ test("non-JSON tool results become model-visible failures without corrupting per
 
   assert.equal(await loop.runTurn({ sessionId: "invalid-result", userInput: "go" }), "handled");
   assert.equal((await store.get("invalid-result"))?.runState?.toolCalls[0]?.status, "failed");
+});
+
+test("AgentLoop mutation gate serializes checkpoints from parallel tool workers", async () => {
+  let modelCalls = 0;
+  const model: ModelClient = {
+    async complete() {
+      modelCalls += 1;
+      return modelCalls === 1
+        ? {
+            toolCalls: Array.from({ length: 4 }, (_, index) => ({
+              id: `parallel-${index}`,
+              name: "parallel",
+              arguments: {},
+            })),
+          }
+        : { content: "done" };
+    },
+  };
+  const tools = new ToolRegistry();
+  tools.register({
+    name: "parallel",
+    description: "Complete without blocking other workers",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    async execute() { return { ok: true }; },
+  });
+  const store = new ConcurrentSaveProbeStore(new InMemorySessionStore());
+  const loop = new AgentLoop({
+    model,
+    tools,
+    sessionStore: store,
+    requestApproval: async () => false,
+  });
+
+  assert.equal(await loop.runTurn({ sessionId: "mutation-gate", userInput: "go" }), "done");
+  assert.equal(store.maximumActiveSaves, 1);
 });

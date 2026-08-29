@@ -20,7 +20,13 @@ runtime process.
 ## Sources of truth
 
 - `AgentLoop` owns the per-session FIFO coordinator for turns and recovery and is the only core component
-  that admits mutations to conversation and run state.
+  that admits mutations to conversation and run state. `ModelRequestPlanner`, `RunRecovery`, and
+  `RunFinalizer` are policy objects: they inspect detached snapshots and return decisions or mutation plans;
+  they never own a Store, live Session, Tool execution, checkpoint, or Event delivery. `AgentLoop` privately
+  creates a per-Run `RunMutationGate`; its internal coordinated executor receives only that gate, not the
+  Store, so parallel workers serialize each admitted mutation with its checkpoint. The deprecated exported
+  `ToolExecutor` direct-construction facade exists only for API compatibility and must not be used by core
+  orchestration.
 - `AgentRuntime` owns protocol-neutral session lifecycle, active-run control, and capability selection.
 - `SessionStore` is the persistence boundary for canonical messages, run state, and tool-call state.
 - `AgentRuntime` derives its Store, Tool registry, and Skill loader from `AgentLoop`. Never add a second
@@ -61,11 +67,15 @@ protocol-level conformance tests for the supported version and capabilities.
 - `channel/` and future protocol adapters normalize input and project output; they do not persist history.
 - `provider/` owns provider-specific request, response, and streaming formats.
 - `runtime/` owns execution mechanics such as retry, cancellation, steering, event projection, and tool
-  scheduling.
+  scheduling. Planning helpers under this boundary remain side-effect-free with respect to canonical state;
+  `AgentLoop` applies their plans and preserves mutation/checkpoint/event ordering.
+- `storage/` owns managed database configuration, startup selection, PostgreSQL/Supabase schema management,
+  and managed Store lifecycle. Supabase is a PostgreSQL profile, not a separate Data API Store engine.
 - `tools/` owns capability definitions and execution, not scheduling or session lifecycle. Session-read-only
   tools receive detached frozen Session snapshots. A write-access tool is trusted and always exclusive.
   External side-effect ordering is separate: use `executionPolicy: "exclusive"` without granting Session
-  mutation; only overlap tools that are explicitly safe to reorder.
+  mutation; only overlap tools that are explicitly safe to reorder. Tool scheduling may request a checkpoint
+  only through the private mutation gate supplied by `AgentLoop`; it must not regain direct Store access.
 - `skills.ts` supplies optional instructions; skills do not own tools, permissions, sessions, or transports.
 - `mcp.ts` adapts MCP tools to the local Tool interface. MCP supplies agent capabilities; ACP exposes and
   controls an agent from its client. Keep these responsibilities distinct.
@@ -100,7 +110,22 @@ protocol-level conformance tests for the supported version and capabilities.
   requires `rewriteMessages`. File Store writes require a per-session queue, unique temporary files, atomic
   rename, and fixed-length lowercase Session-ID paths with stored-ID verification on every read/delete.
   Reject empty or ill-formed Unicode Session IDs at every Store and Runtime admission boundary.
-- A Runtime process owns a distinct Store. Cross-process shared File/SQLite Stores are unsupported.
+- Managed database selection is a startup-only decision. In `auto` mode the priority is PostgreSQL, then
+  Supabase, then SQLite. Every declared profile must be complete and valid. Once a profile is selected,
+  readiness or connection failure must fail startup; never fall through to a lower-priority Store or switch
+  Stores while running.
+- PostgreSQL and Supabase use the same PostgreSQL Store implementation and the private `agent_runtime`
+  schema. Supabase configuration accepts a database URL, not a Data API URL/key. Keep schema migration
+  privileged access separate from runtime DML access; production startup checks schema compatibility by
+  default, while DDL is an explicit migration/deployment action. If migration and runtime roles differ,
+  deployment must provision the runtime role's private-schema usage and table permissions explicitly.
+- A database namespace is part of persisted PostgreSQL identity. At most one Runtime process may own a
+  given `(namespace, Session ID)` at a time; version checks are not cross-process FIFO or external-side-effect
+  locks. A physical PostgreSQL database may host disjoint ownership domains, but sharing one File/SQLite
+  file across Runtime processes remains unsupported.
+- A managed Store is created and owned by the embedding host. Close the Runtime first so admitted work can
+  finish, then close the Store and its database resources. `AgentRuntime.close()` must not silently close an
+  injected Store it does not own.
 
 ## Cancellation and event delivery
 

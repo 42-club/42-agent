@@ -5,6 +5,8 @@ import {
   AiSdkModelClient,
   createAiSdkOpenRouterClient,
   createMessage,
+  estimateTokenUpperBound,
+  type ModelRequest,
   type ModelStreamEvent,
 } from "../src/index.js";
 
@@ -205,6 +207,74 @@ test("OpenRouter AI SDK factory constructs a configured client", () => {
     baseUrl: "https://example.invalid/v1",
     appName: "Runtime Tests",
     httpReferer: "https://example.invalid",
+    contextWindowTokens: 65_536,
+    maxOutputTokens: 8_192,
   });
   assert.ok(client instanceof AiSdkModelClient);
+  assert.deepEqual(client.capabilities, {
+    contextWindowTokens: 65_536,
+    maxOutputTokens: 8_192,
+  });
+});
+
+test("OpenRouter AI SDK client lazily resolves and caches model limits", async () => {
+  const urls: string[] = [];
+  const client = createAiSdkOpenRouterClient({
+    apiKey: "test-key",
+    model: "test/model:latest",
+    baseUrl: "https://example.invalid/v1/",
+    fetch: async (input) => {
+      urls.push(String(input));
+      return Response.json({
+        data: {
+          context_length: 131_072,
+          top_provider: { max_completion_tokens: 16_384 },
+        },
+      });
+    },
+  });
+
+  assert.deepEqual(await client.getCapabilities(), {
+    contextWindowTokens: 131_072,
+    maxOutputTokens: 16_384,
+  });
+  assert.deepEqual(await client.getCapabilities(), {
+    contextWindowTokens: 131_072,
+    maxOutputTokens: 16_384,
+  });
+  assert.deepEqual(urls, ["https://example.invalid/v1/model/test/model%3Alatest"]);
+});
+
+test("OpenRouter AI SDK estimation matches its streaming wire payload", async () => {
+  let payload: unknown;
+  const sse = [
+    'data: {"id":"x","created":1,"model":"test/model","choices":[{"index":0,"delta":{"role":"assistant","content":"done"},"finish_reason":null}]}',
+    'data: {"id":"x","created":1,"model":"test/model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}',
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+  const client = createAiSdkOpenRouterClient({
+    apiKey: "test-key",
+    model: "test/model",
+    contextWindowTokens: 10_000,
+    fetch: async (_input, init) => {
+      payload = JSON.parse(String(init?.body));
+      return new Response(sse, { headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  const request: ModelRequest = {
+    systemPrompt: "system",
+    messages: [createMessage({ role: "user", content: "hello" })],
+    tools: [{
+      name: "lookup",
+      description: "lookup",
+      inputSchema: { type: "object", properties: { q: { type: "string" } } },
+    }],
+  };
+  const estimate = await client.estimateRequestTokens(request);
+
+  for await (const _event of client.stream(request)) {
+    // Consume the stream so the AI SDK serializes the complete provider request.
+  }
+  assert.equal(estimate, estimateTokenUpperBound(JSON.stringify(payload)));
 });

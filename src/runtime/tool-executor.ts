@@ -1,5 +1,11 @@
 import type { ToolCall } from "../model.js";
-import { createMessage, type RunState, type SessionStore } from "../session.js";
+import {
+  createMessage,
+  type RunState,
+  type SaveSessionOptions,
+  type Session,
+  type SessionStore,
+} from "../session.js";
 import type { ToolExecutionContext } from "../tools/base.js";
 import { ToolRegistry } from "../tools/base.js";
 import type { AgentLoopEvent, EventDispatcher } from "./events.js";
@@ -21,12 +27,68 @@ type WorkerSettlement =
   | { scheduled: ScheduledCall; succeeded: true }
   | { scheduled: ScheduledCall; succeeded: false; error: unknown };
 
+/** Per-Run mutation admission supplied privately by AgentLoop. */
+interface RunMutationGate {
+  readonly checkpoint: (mutate?: () => void, options?: SaveSessionOptions) => Promise<void>;
+}
+
+/**
+ * Backwards-compatible direct executor facade.
+ *
+ * @deprecated Prefer AgentLoop, which owns mutation admission and supplies a
+ * private per-Run gate to the coordinated executor.
+ */
 export class ToolExecutor {
   private persistenceTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly tools: ToolRegistry,
     private readonly sessions: SessionStore,
+    private readonly events: EventDispatcher,
+    private readonly maxConcurrency = 4,
+  ) {}
+
+  executeAll(
+    calls: readonly ToolCall[],
+    context: ToolExecutionContext,
+    runState: RunState,
+  ): Promise<void> {
+    const gate: RunMutationGate = Object.freeze({
+      checkpoint: (mutate?: () => void, options?: SaveSessionOptions) => this.checkpoint(
+        context.session,
+        mutate,
+        options,
+      ),
+    });
+    return new CoordinatedToolExecutor(
+      this.tools,
+      gate,
+      this.events,
+      this.maxConcurrency,
+    ).executeAll(calls, context, runState);
+  }
+
+  private async checkpoint(
+    session: Session,
+    mutate?: () => void,
+    options?: SaveSessionOptions,
+  ): Promise<void> {
+    const pending = this.persistenceTail
+      .catch(() => undefined)
+      .then(async () => {
+        mutate?.();
+        await this.sessions.save(session, options);
+      });
+    this.persistenceTail = pending.catch(() => undefined);
+    await pending;
+  }
+}
+
+/** @internal AgentLoop is the only package component that constructs this class. */
+export class CoordinatedToolExecutor {
+  constructor(
+    private readonly tools: ToolRegistry,
+    private readonly mutationGate: RunMutationGate,
     private readonly events: EventDispatcher,
     private readonly maxConcurrency = 4,
   ) {}
@@ -44,7 +106,7 @@ export class ToolExecutor {
       arguments: structuredClone(call.arguments),
       status: "pending" as const,
     })));
-    await this.persist(context);
+    await this.persist();
 
     const outcomes = new Map<string, ToolOutcome>();
     const pending: ScheduledCall[] = calls.map((call, index) => ({
@@ -106,7 +168,7 @@ export class ToolExecutor {
       const reason = context.signal?.aborted
         ? "Tool execution was cancelled before it started"
         : "Tool execution was interrupted before it started";
-      await this.persist(context, () => {
+      await this.persist(() => {
         for (const { call } of pending) {
           const state = this.callState(runState, call.id);
           state.status = "interrupted";
@@ -120,7 +182,7 @@ export class ToolExecutor {
     // Materialize every terminal outcome only after all started workers have settled.
     // Iterating the model's call list makes the messages deterministic even when tools
     // completed in a different order.
-    await this.persist(context, () => {
+    await this.persist(() => {
       for (const call of calls) {
         const outcome = outcomes.get(call.id);
         if (!outcome) continue;
@@ -145,7 +207,7 @@ export class ToolExecutor {
   ): Promise<void> {
     const { call } = scheduled;
     throwIfAborted(context.signal);
-    await this.persist(context, () => {
+    await this.persist(() => {
       const state = this.callState(runState, call.id);
       state.status = "running";
       runState.updatedAt = new Date().toISOString();
@@ -171,7 +233,7 @@ export class ToolExecutor {
         : { status: "failed", error: message };
     }
 
-    await this.persist(context, () => {
+    await this.persist(() => {
       const state = this.callState(runState, call.id);
       state.status = outcome.status;
       if (outcome.status === "completed") {
@@ -235,18 +297,10 @@ export class ToolExecutor {
   }
 
   private async persist(
-    context: ToolExecutionContext,
     mutate?: () => void,
-    options?: { rewriteMessages?: boolean },
+    options?: SaveSessionOptions,
   ): Promise<void> {
-    const pending = this.persistenceTail
-      .catch(() => undefined)
-      .then(async () => {
-        mutate?.();
-        await this.sessions.save(context.session, options);
-      });
-    this.persistenceTail = pending.catch(() => undefined);
-    await pending;
+    await this.mutationGate.checkpoint(mutate, options);
   }
 
   private async emitSafely(event: AgentLoopEvent): Promise<void> {

@@ -17,7 +17,8 @@ AI Agent。它的定位是生产应用下层的执行底座，而不是应用层
 
 Runtime 被有意设计为单进程构建单元。生产应用可以同时启动多个 42 Agent 进程并行运行。这些
 Agent 相互独立：它们不共享进程内队列、不通过共同的 `SessionStore` 协调，也不需要分布式锁。
-每个进程必须使用独立 Store；多个 Runtime 共享同一个 File 或 SQLite Store 不属于支持的进程模型。
+每个进程必须使用独立的 File/SQLite Store。多个进程只有在应用保证所有权互不重叠时才能共用同一
+物理 PostgreSQL 数据库；任一 `(namespace, Session ID)` 同一时刻最多由一个进程拥有。
 
 Runtime 上层的应用负责 Agent 发现、任务拆解、调度、结果路由、协作策略、身份、租户和部署。
 如果 Agent A 的输出需要成为 Agent B 的输入，这层关系应由应用层 Orchestrator 建立，而不是
@@ -136,16 +137,23 @@ Channel C ─┘
 - 在模型/工具边界应用 Steering
 - 在模型和工具边界保存持久化检查点
 - 保守的崩溃恢复：绝不自动重放结果不确定的副作用
-- 仅更新已有 Session、带版本检查的内存、文件和 SQLite SessionStore
+- 仅更新已有 Session、带版本检查的内存、文件、SQLite 和 PostgreSQL SessionStore；Supabase 复用
+  PostgreSQL 引擎
+- 托管数据库在启动时按 PostgreSQL > Supabase > SQLite 选择，失败时不自动回退
+- 模型请求、恢复和终态策略只返回计划，统一由 `AgentLoop` 应用并持久化
 - 同一 Session 的 Turn 与恢复共用 FIFO，不同 Session 并发执行
 - 仅接受格式完好的 Unicode Session ID，File Store 使用固定长度摘要路径并核对文件内规范 ID
 
 ## 架构
 
 `AgentRuntime` 是唯一面向协议的生命周期 Facade。它从 `AgentLoop` 派生 Store、Tool Registry 和
-Skill Loader，避免校验、执行、关闭与恢复连接到不同的事实来源。`AgentLoop` 持有 per-session FIFO 协调器，
-`SessionStore` 是持久化边界。Channel 负责规范化输入并投影 best-effort 事件；Provider 负责统一
-模型 API；Tool 负责执行能力。边界定义与恢复语义详见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
+Skill Loader，避免校验、执行、关闭与恢复连接到不同的事实来源。`AgentLoop` 持有 per-session FIFO
+协调器并保持为唯一核心变更协调者；`ModelRequestPlanner`、`RunRecovery` 与 `RunFinalizer` 只返回
+计划，由 Loop 应用、保存并安排 Event 顺序。Loop 内部的协调式 Tool Executor 只接收私有的 per-Run
+Mutation Gate，由该 Gate 把获准变更与其检查点串行绑定。公开导出的 `ToolExecutor` 只为兼容旧的
+直接构造 API 而保留并已弃用，`AgentLoop` 不使用它。`SessionStore` 是持久化边界。Channel 负责
+规范化输入并投影 best-effort 事件；Provider 负责统一模型 API；Tool 负责执行能力。边界、数据库
+选择与恢复语义详见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
 
 ## 快速开始
 
@@ -170,16 +178,121 @@ npm run check
 函数至少 80%。GitHub Actions 会在 Node.js 22.13、24 和 26 上执行 Lint、类型检查、覆盖率门禁及
 `npm pack --dry-run`。
 
-Package 入口指向 `dist/src/index.js` 及对应类型声明，并通过 `42-agent/acp` 暴露 ACP Adapter。
+Package 入口指向 `dist/src/index.js` 及对应类型声明，并通过 `42-agent/acp` 暴露 ACP Adapter，
+通过 `42-agent/storage` 暴露托管数据库 Store。
 项目采用 [Apache-2.0](./LICENSE) 许可证，并已配置为可公开发布到 npm。公开发布使用语义化版本，
 且必须由维护者显式执行；`npm pack --dry-run` 只校验发布内容，不会实际发布。
+
+## 托管数据库存储
+
+`openSessionStore` 接受 PostgreSQL、Supabase 和 SQLite 三种配置 Profile，底层对应两种物理引擎。
+默认 `auto` 模式按 PostgreSQL、Supabase、SQLite 的顺序选择：
+
+```ts
+import { resolve } from "node:path";
+import {
+  migratePostgresSchema,
+  openSessionStore,
+  resolveSessionDatabaseConfig,
+  type SessionDatabaseConfig,
+} from "42-agent/storage";
+
+const storageConfig: SessionDatabaseConfig = {
+  namespace: "orders-agent",
+  ...(process.env.AGENT_POSTGRES_URL
+    ? { postgres: { connectionString: process.env.AGENT_POSTGRES_URL } }
+    : {}),
+  ...(process.env.SUPABASE_DATABASE_URL
+    ? {
+        supabase: {
+          databaseUrl: process.env.SUPABASE_DATABASE_URL,
+          // 仅用于明确使用明文连接的本地/自托管数据库。
+          ...(process.env.SUPABASE_DATABASE_SSL === "false" ? { ssl: false } : {}),
+        },
+      }
+    : {}),
+  sqlite: { filename: resolve(".agent-data/runtime.sqlite") },
+};
+
+// 可安全记录：诊断结果不包含凭据。
+console.log(resolveSessionDatabaseConfig(storageConfig));
+const sessionStore = await openSessionStore(storageConfig);
+```
+
+选择前会校验所有已声明的 Profile，因此部分配置会直接报错。Profile 一旦选定，连接或
+Readiness 失败就会使启动失败，不会继续回退到其他 Profile；Runtime 运行期间也不会切换
+规范 Store。显式的 `mode: "postgres" | "supabase" | "sqlite"` 只选择对应 Profile。新增远程
+Profile 不会自动迁移现有 SQLite 数据。
+
+Supabase 使用其 PostgreSQL `databaseUrl`，而不是 `supabase-js`、Data API Key 或 REST/GraphQL API。
+对这个长驻 Node Runtime，应使用[直连数据库，或在只有 IPv4 时使用 Session
+Pooler](https://supabase.com/docs/guides/database/connecting-to-postgres)。PostgreSQL 和 Supabase 数据位于私有
+`agent_runtime` Schema，并以 `(namespace, Session ID)` 为键；应用必须保证不会有两个进程同时拥有
+同一组合。
+
+对每个 Supabase `databaseUrl` 和 `migrationUrl`，如果该 URL 不包含任何 PostgreSQL TLS 参数
+（`ssl`、`sslmode`、`sslcert`、`sslkey`、`sslrootcert` 或 `sslnegotiation`），TLS 默认为
+`ssl: true`；如果 URL 已包含其中任一参数，本库会让 `pg` 为该连接解析 TLS 设置。Profile 级
+`ssl` 显式配置不能与任一 URL 中的 TLS 参数混用。只有在本地或自托管数据库明确使用明文连接时
+才设置 `ssl: false`；Hosted Supabase 绝不能关闭 TLS。安全解析诊断会在本库决定 TLS 时显示
+`ssl`，由 URL 控制 TLS 时则省略该字段。
+
+PostgreSQL 引擎默认以 `schemaMode: "check"` 启动。DDL 应通过部署步骤显式执行：调用
+`migratePostgresSchema(...)`，或为 Profile 显式设置 `schemaMode: "migrate"`；可选的
+`migrationConnectionString`/`migrationUrl` 可把迁移所需的高权限凭据与 Runtime 凭据分离。
+该显式调用应置于部署流水线；Supabase 提供了[数据库迁移流程](https://supabase.com/docs/guides/deployment/database-migrations)
+说明。`openSessionStore` 会在返回前完成 Readiness 检查。
+
+独立迁移 API 也要求显式 Profile，因此 Supabase 会保持相同的安全 TLS 默认值：
+
+```ts
+await migratePostgresSchema({
+  profile: "supabase",
+  databaseUrl: process.env.SUPABASE_MIGRATION_URL
+    ?? process.env.SUPABASE_DATABASE_URL!,
+});
+
+// 普通 PostgreSQL 部署沿用连接串中的 TLS 策略。
+await migratePostgresSchema({
+  profile: "postgres",
+  connectionString: process.env.POSTGRES_MIGRATION_URL!,
+});
+```
+
+如果迁移与 Runtime 连接使用不同的数据库 Role，部署步骤还必须为 Runtime Role 授予私有
+Schema 及数据表权限；本库不会推断或创建该 Role。例如，在迁移后以 Schema Owner 执行以下 SQL，
+并把 `agent_runtime_user` 替换成 Runtime Role；后续迁移新增数据表时也需补充授权：
+
+```sql
+GRANT USAGE ON SCHEMA agent_runtime TO agent_runtime_user;
+GRANT SELECT ON agent_runtime.schema_migrations TO agent_runtime_user;
+GRANT SELECT, INSERT, UPDATE, DELETE
+  ON agent_runtime.sessions, agent_runtime.messages,
+     agent_runtime.runs, agent_runtime.tool_calls
+  TO agent_runtime_user;
+```
+
+托管 Store 归嵌入宿主所有。应先关闭 Runtime，等待已入场工作结束，再释放 Store 的数据库资源：
+
+```ts
+await server.close();       // 停止接收请求。
+await runtime.close();      // 等待已入场工作结束。
+await sessionStore.close(); // 释放连接池/数据库。
+```
 
 运行由 OpenRouter 提供模型能力的 HTTP Runtime：
 
 ```bash
 export OPENROUTER_API_KEY=...
+# 可选。如果同时设置两个远程 URL，PostgreSQL 优先。
+export AGENT_POSTGRES_URL=postgresql://...
+# 或：export SUPABASE_DATABASE_URL=postgresql://...
+# 第一次显式迁移：export AGENT_DATABASE_SCHEMA_MODE=migrate
 npm run runtime
 ```
+
+如果两个远程 URL 都未设置，示例会使用配置的 SQLite 文件。完整环境变量映射与响应
+系统信号时的安全关闭顺序见 [`examples/runtime-server.ts`](./examples/runtime-server.ts)。
 
 HTTP Server 是可信开发环境下的 Adapter，不是生产入口：它不提供认证，默认只监听 loopback，
 浏览器 Origin 必须与显式 `allowedOrigin` 精确匹配，请求必须为 JSON，请求体与待发送 Event 都有
@@ -200,7 +313,8 @@ npm run cli -- --session shared-session
 - 显式恢复使用同一 per-session FIFO，不会与活动 Turn 竞态执行。
 - 在进入 FIFO 执行槽位前已取消的请求不会创建 Run，也不会追加 User Message。
 - Steering 与取消在 Turn 终态屏障处关闭入场；控制消息不会泄漏到下一个 Turn。
-- 不同 Runtime 进程相互独立，可以并发执行而不共享 Session 状态。
+- 不同 Runtime 进程相互独立，可以并发执行；即使 Store 使用同一物理 PostgreSQL 数据库，也不能
+  同时拥有同一个带 Namespace 的 Session。
 - 取消会停止派发新工具，并在所有已启动工具结束前保持 Turn 未完成。
 - 重复或重入的 Runtime/Session Close 会等待同一个关闭操作；关闭会阻止新工作，等待已入场的
   读取、恢复、Turn 与 Tool 完成，然后按请求删除 Session 状态。
@@ -262,6 +376,7 @@ src/acp/                基于官方 SDK 的 ACP v1 Adapter、权限桥和更新
 src/channel/            可复用的 Channel Adapter
 src/tools/              本地工具
 src/mcp.ts              MCP Tool 策略、结果规范化、刷新与生命周期
+src/storage/            托管数据库选择、迁移和 Store 生命周期
 src/session*.ts         Session 契约和 Store
 examples/               最小示例和 HTTP Runtime 示例
 tests/                  Runtime 与集成测试

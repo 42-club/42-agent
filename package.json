@@ -23,6 +23,10 @@
       "types": "./dist/src/acp/index.d.ts",
       "import": "./dist/src/acp/index.js"
     },
+    "./storage": {
+      "types": "./dist/src/storage/index.d.ts",
+      "import": "./dist/src/storage/index.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -60,8 +64,11 @@
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.4.0",
     "@ai-sdk/openai-compatible": "^3.0.32",
+    "@types/json-schema": "7.0.15",
+    "@types/pg": "8.23.1",
     "ai": "^7.0.70",
     "ajv": "^8.20.0",
+    "pg": "8.23.0",
     "zod": "^4.4.3"
   },
   "repository": {
