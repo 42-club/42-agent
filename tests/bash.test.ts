@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdtemp, realpath, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BashPolicy, BashTool } from "../src/index.js";
+import { BashPolicy, BashTool } from "../src/tools/index.js";
 
 test("denies delete operations", () => {
   const policy = new BashPolicy();

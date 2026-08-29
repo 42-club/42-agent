@@ -39,18 +39,21 @@ export interface ToolDescriptor extends ToolDefinition {
 export class ToolRegistry {
   private readonly tools = new Map<string, Tool>();
   private readonly validators = new Map<string, ValidateFunction>();
-  private readonly ajv: {
+  private errorFormatter?: (
+    errors?: ValidateFunction["errors"],
+    options?: { separator: string },
+  ) => string;
+  private ajv?: {
     compile(schema: object): ValidateFunction;
     errorsText(errors?: ValidateFunction["errors"], options?: { separator: string }): string;
-  } = new (Ajv2020 as unknown as new (options: object) => {
-    compile(schema: object): ValidateFunction;
-    errorsText(errors?: ValidateFunction["errors"], options?: { separator: string }): string;
-  })({ allErrors: true, strict: false });
+  };
 
   register(tool: Tool): void {
     if (this.tools.has(tool.name)) throw new Error(`Tool already registered: ${tool.name}`);
-    this.tools.set(tool.name, tool);
-    this.validators.set(tool.name, this.ajv.compile(tool.inputSchema));
+    const registered = snapshotTool(tool);
+    const validator = this.compiler().compile(registered.inputSchema);
+    this.tools.set(registered.name, registered);
+    this.validators.set(registered.name, validator);
   }
 
   unregister(name: string): boolean {
@@ -66,7 +69,7 @@ export class ToolRegistry {
     const validate = this.validators.get(name);
     if (!validate) throw new Error(`Unknown tool: ${name}`);
     if (!validate(input)) {
-      const details = this.ajv.errorsText(validate.errors, { separator: "; " });
+      const details = this.formatValidationErrors(validate.errors);
       throw new InvalidToolInputError(name, details);
     }
   }
@@ -113,14 +116,65 @@ export class ToolRegistry {
   }
 
   select(names: readonly string[]): ToolRegistry {
+    return this.snapshot(names);
+  }
+
+  /**
+   * Capture the capabilities exposed to one Turn.
+   *
+   * Tool implementations may retain their own internal state, so execution is
+   * bound to the implementation object that was registered at capture time.
+   * Registry membership and all host-controlled descriptor fields are copied;
+   * later registration changes or mutations of the original Tool object cannot
+   * change this snapshot's model definitions, validation, or scheduling policy.
+   */
+  snapshot(names?: readonly string[]): ToolRegistry {
     const registry = new ToolRegistry();
-    for (const name of names) registry.register(this.get(name));
+    const selected = names ? names.map((name) => this.get(name)) : [...this.tools.values()];
+    for (const tool of selected) {
+      if (registry.tools.has(tool.name)) {
+        throw new Error(`Tool already registered: ${tool.name}`);
+      }
+      // Registered Tool descriptors are already frozen and their execute
+      // implementation is already bound. Copying those references plus the
+      // compiled validator gives this membership snapshot O(number of tools)
+      // cost without recompiling every JSON Schema on every Turn.
+      registry.tools.set(tool.name, tool);
+      registry.validators.set(tool.name, this.validators.get(tool.name)!);
+    }
+    registry.errorFormatter = this.errorFormatter;
     return registry;
   }
 
   effectiveExecutionPolicy(tool: Tool): "parallel" | "exclusive" {
     return tool.sessionAccess === "write" ? "exclusive" : tool.executionPolicy ?? "parallel";
   }
+
+  private compiler(): NonNullable<ToolRegistry["ajv"]> {
+    this.ajv ??= new (Ajv2020 as unknown as new (options: object) => {
+      compile(schema: object): ValidateFunction;
+      errorsText(errors?: ValidateFunction["errors"], options?: { separator: string }): string;
+    })({ allErrors: true, strict: false });
+    this.errorFormatter ??= this.ajv.errorsText.bind(this.ajv);
+    return this.ajv;
+  }
+
+  private formatValidationErrors(errors?: ValidateFunction["errors"]): string {
+    if (!this.errorFormatter) this.compiler();
+    return this.errorFormatter!(errors, { separator: "; " });
+  }
+}
+
+function snapshotTool(tool: Tool): Tool {
+  const execute = tool.execute.bind(tool);
+  return Object.freeze({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: deepFreeze(structuredClone(tool.inputSchema)),
+    sessionAccess: tool.sessionAccess,
+    executionPolicy: tool.executionPolicy,
+    execute,
+  });
 }
 
 function immutableSessionSnapshot(session: Session): ReadonlySession {

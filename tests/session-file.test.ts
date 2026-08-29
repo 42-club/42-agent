@@ -4,11 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-  FileSessionStore,
   SessionAlreadyExistsError,
   createMessage,
   type Session,
 } from "../src/index.js";
+import { FileSessionStore } from "../src/storage/index.js";
 
 test("File store persists sessions and advances their version on every save", async () => {
   await withStoreDirectory(async (directory) => {

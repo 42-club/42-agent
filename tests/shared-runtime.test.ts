@@ -4,13 +4,13 @@ import test from "node:test";
 import {
   AgentLoop,
   AgentRuntime,
-  ConversationCompressionTool,
   InMemorySessionStore,
+  RuntimeError,
   ToolRegistry,
-  createAgentRuntimeHttpServer,
-  streamRuntimeTurn,
   type ModelClient,
 } from "../src/index.js";
+import { createAgentRuntimeHttpServer, streamRuntimeTurn } from "../src/channel/index.js";
+import { ConversationCompressionTool } from "../src/tools/index.js";
 
 test("different channels can share one canonical server-side session", async () => {
   const model: ModelClient = {
@@ -224,8 +224,12 @@ test("HTTP runtime bounds bodies and rejects untrusted browser writes", async ()
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ sessionId: "large", userInput: "x".repeat(128) }),
     });
-    assert.equal(tooLarge.status, 400);
-    assert.match(await tooLarge.text(), /Request body exceeds 64 bytes/);
+    assert.equal(tooLarge.status, 413);
+    assert.deepEqual(await tooLarge.json(), {
+      type: "error",
+      code: "PayloadTooLarge",
+      message: "Request body exceeds the 64-byte limit",
+    });
 
     const crossOrigin = await fetch(`${url}/v1/turn`, {
       method: "POST",
@@ -249,7 +253,11 @@ test("HTTP runtime bounds bodies and rejects untrusted browser writes", async ()
       body: JSON.stringify({ sessionId: "\ud800", userInput: "go" }),
     });
     assert.equal(invalidSessionId.status, 400);
-    assert.match(await invalidSessionId.text(), /well-formed Unicode/);
+    assert.deepEqual(await invalidSessionId.json(), {
+      type: "error",
+      code: "InvalidSessionId",
+      message: "sessionId is invalid",
+    });
     assert.equal(modelCalls, 0);
 
     const trusted = await fetch(`${url}/v1/turn`, {
@@ -266,6 +274,65 @@ test("HTTP runtime bounds bodies and rejects untrusted browser writes", async ()
       "https://trusted.example",
     );
     assert.equal(modelCalls, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("HTTP classifies admission failures and redacts internal streaming errors", async () => {
+  const secret = "postgresql://admin:super-secret@database.internal/runtime";
+  const model: ModelClient = {
+    async complete() {
+      throw new RuntimeError(`SECRET_${secret}`, secret);
+    },
+  };
+  const sessions = new InMemorySessionStore();
+  const loop = new AgentLoop({
+    model,
+    tools: new ToolRegistry(),
+    sessionStore: sessions,
+    requestApproval: async () => false,
+    config: { retry: { maxAttempts: 1 } },
+  });
+  const runtime = new AgentRuntime({ loop });
+  const server = createAgentRuntimeHttpServer(runtime, { port: 0 });
+  const address = await server.listen();
+  const url = `http://${address.host}:${address.port}`;
+
+  try {
+    const malformed = await fetch(`${url}/v1/turn`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not-json",
+    });
+    assert.equal(malformed.status, 400);
+    assert.equal((await malformed.json() as { code: string }).code, "MalformedJson");
+
+    const unknownTool = await fetch(`${url}/v1/turn`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sessionId: "unknown-http-tool",
+        userInput: "go",
+        tools: ["missing"],
+      }),
+    });
+    assert.equal(unknownTool.status, 400);
+    assert.equal(
+      (await unknownTool.json() as { code: string }).code,
+      "InvalidCapabilitySelection",
+    );
+
+    const failedTurn = await fetch(`${url}/v1/turn`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: "redacted-http-error", userInput: "go" }),
+    });
+    assert.equal(failedTurn.status, 200);
+    const stream = await failedTurn.text();
+    assert.doesNotMatch(stream, /super-secret|database\.internal/);
+    assert.match(stream, /"code":"InternalError"/);
+    assert.match(stream, /"message":"Runtime request failed"/);
   } finally {
     await server.close();
   }

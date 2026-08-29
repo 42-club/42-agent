@@ -6,12 +6,12 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   AgentLoop,
-  ConversationCompressionTool,
-  SqliteSessionStore,
   ToolRegistry,
   createMessage,
   type ModelClient,
 } from "../src/index.js";
+import { SqliteSessionStore } from "../src/storage/index.js";
+import { ConversationCompressionTool } from "../src/tools/index.js";
 
 test("SQLite persists messages, runs, and tool calls across store instances", async () => {
   const directory = await mkdtemp(join(tmpdir(), "42-agent-sqlite-"));

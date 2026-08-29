@@ -6,4 +6,3 @@ export * from "./retry.js";
 export * from "./run-finalizer.js";
 export * from "./run-recovery.js";
 export * from "./steering.js";
-export { ToolExecutor } from "./tool-executor.js";

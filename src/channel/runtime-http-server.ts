@@ -1,6 +1,14 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { AgentRuntime } from "../agent-runtime.js";
+import {
+  InvalidCapabilitySelectionError,
+  RuntimeClosedError,
+  SessionBindingMismatchError,
+  SessionCapabilityDeniedError,
+  SessionClosingError,
+  SessionNotFoundError,
+  type AgentRuntime,
+} from "../agent-runtime.js";
 import type { AgentLoopEvent } from "../runtime/events.js";
 import { assertValidSessionId } from "../session.js";
 
@@ -68,10 +76,6 @@ export function createAgentRuntimeHttpServer(
     try {
       const body = await readJson<TurnRequest>(request, maxBodyBytes, controller.signal);
       validateTurn(body);
-      response.writeHead(200, {
-        "content-type": "application/x-ndjson; charset=utf-8",
-        "cache-control": "no-cache, no-transform",
-      });
       const writer = new BoundedNdjsonWriter(
         response,
         controller,
@@ -86,7 +90,10 @@ export function createAgentRuntimeHttpServer(
         tools: body.tools,
         metadata: body.metadata,
         signal: controller.signal,
-        onEvent: (event: AgentLoopEvent) => writer.enqueue({ type: "event", event }),
+        onEvent: (event: AgentLoopEvent) => writer.enqueue({
+          type: "event",
+          event: sanitizeEventForHttp(event),
+        }),
       });
       await writer.write({
         type: "result",
@@ -97,13 +104,14 @@ export function createAgentRuntimeHttpServer(
       });
       response.end();
     } catch (error) {
-      const payload = { type: "error", message: error instanceof Error ? error.message : String(error) };
+      const failure = toHttpFailure(error);
+      const payload = { type: "error", code: failure.code, message: failure.message };
       if (response.destroyed) {
         // A disconnected or backpressured client already owns this failure.
       } else if (response.headersSent) {
         response.end(`${JSON.stringify(payload)}\n`);
       } else {
-        sendJson(response, 400, payload);
+        sendJson(response, failure.status, payload);
       }
     } finally {
       activeRequests.delete(controller);
@@ -133,9 +141,17 @@ export function createAgentRuntimeHttpServer(
 
 function validateTurn(body: TurnRequest): void {
   if (!body || typeof body.sessionId !== "string" || typeof body.userInput !== "string") {
-    throw new Error("sessionId and userInput are required");
+    throw new HttpRequestError(
+      400,
+      "InvalidTurnRequest",
+      "sessionId and userInput must be strings",
+    );
   }
-  assertValidSessionId(body.sessionId);
+  try {
+    assertValidSessionId(body.sessionId);
+  } catch {
+    throw new HttpRequestError(400, "InvalidSessionId", "sessionId is invalid");
+  }
   for (const [name, value] of [
     ["promptInjections", body.promptInjections],
     ["skills", body.skills],
@@ -143,12 +159,12 @@ function validateTurn(body: TurnRequest): void {
   ] as const) {
     if (value !== undefined && (!Array.isArray(value)
       || !value.every((item) => typeof item === "string"))) {
-      throw new Error(`${name} must be an array of strings`);
+      throw new HttpRequestError(400, "InvalidTurnRequest", `${name} must be an array of strings`);
     }
   }
   if (body.metadata !== undefined
     && (typeof body.metadata !== "object" || body.metadata === null || Array.isArray(body.metadata))) {
-    throw new Error("metadata must be an object");
+    throw new HttpRequestError(400, "InvalidTurnRequest", "metadata must be an object");
   }
 }
 
@@ -175,8 +191,18 @@ async function readJson<T>(
       chunks.push(buffer);
     }
     if (signal?.aborted) throw abortReason(signal);
-    if (tooLarge) throw new Error(`Request body exceeds ${maxBytes} bytes`);
-    return JSON.parse(Buffer.concat(chunks).toString("utf8")) as T;
+    if (tooLarge) {
+      throw new HttpRequestError(
+        413,
+        "PayloadTooLarge",
+        `Request body exceeds the ${maxBytes}-byte limit`,
+      );
+    }
+    try {
+      return JSON.parse(Buffer.concat(chunks).toString("utf8")) as T;
+    } catch {
+      throw new HttpRequestError(400, "MalformedJson", "Request body must be valid JSON");
+    }
   } finally {
     signal?.removeEventListener("abort", abort);
   }
@@ -251,6 +277,7 @@ class BoundedNdjsonWriter {
       return;
     }
 
+    this.beginStream();
     this.queuedBytes += bytes;
     const pending = this.tail.then(() => writeLine(this.response, line));
     this.tail = pending
@@ -263,7 +290,17 @@ class BoundedNdjsonWriter {
   async write(payload: unknown): Promise<void> {
     await this.tail;
     if (this.failure !== undefined) throw this.failure;
-    await writeLine(this.response, encodeNdjson(payload));
+    const line = encodeNdjson(payload);
+    this.beginStream();
+    await writeLine(this.response, line);
+  }
+
+  private beginStream(): void {
+    if (this.response.headersSent) return;
+    this.response.writeHead(200, {
+      "content-type": "application/x-ndjson; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+    });
   }
 
   private fail(error: unknown): void {
@@ -272,6 +309,65 @@ class BoundedNdjsonWriter {
     this.controller.abort(error);
     this.response.destroy(error instanceof Error ? error : undefined);
   }
+}
+
+class HttpRequestError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "HttpRequestError";
+  }
+}
+
+interface HttpFailure {
+  status: number;
+  code: string;
+  message: string;
+}
+
+function toHttpFailure(error: unknown): HttpFailure {
+  if (error instanceof HttpRequestError) {
+    return { status: error.status, code: error.code, message: error.message };
+  }
+  if (error instanceof InvalidCapabilitySelectionError) {
+    return { status: 400, code: "InvalidCapabilitySelection", message: error.message };
+  }
+  if (error instanceof SessionCapabilityDeniedError) {
+    return { status: 403, code: "SessionCapabilityDenied", message: "Capability is not allowed" };
+  }
+  if (error instanceof SessionNotFoundError || error instanceof SessionBindingMismatchError) {
+    return { status: 404, code: "SessionNotFound", message: "Session not found" };
+  }
+  if (error instanceof SessionClosingError) {
+    return { status: 409, code: "SessionClosing", message: "Session is closing" };
+  }
+  if (error instanceof RuntimeClosedError) {
+    return { status: 503, code: "RuntimeUnavailable", message: "Runtime is unavailable" };
+  }
+  if (error instanceof Error && error.name === "AbortError") {
+    return { status: 503, code: "RequestCancelled", message: "Request was cancelled" };
+  }
+  return { status: 500, code: "InternalError", message: "Runtime request failed" };
+}
+
+function sanitizeEventForHttp(event: AgentLoopEvent): AgentLoopEvent {
+  if (event.type === "model_retry" || event.type === "run_failed") {
+    return {
+      ...event,
+      error: {
+        code: "RUNTIME_ERROR",
+        message: "Runtime operation failed",
+        retryable: event.error.retryable,
+      },
+    };
+  }
+  if (event.type === "tool_call_failed") {
+    return { ...event, error: "Tool call failed" };
+  }
+  return event;
 }
 
 function encodeNdjson(payload: unknown): string {

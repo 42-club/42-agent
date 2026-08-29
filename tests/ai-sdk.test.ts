@@ -4,6 +4,8 @@ import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 import {
   AiSdkModelClient,
   createAiSdkOpenRouterClient,
+} from "../src/provider/index.js";
+import {
   createMessage,
   estimateTokenUpperBound,
   type ModelRequest,

@@ -16,13 +16,15 @@ import {
 import {
   AgentRuntime,
   RuntimeClosedError,
+  SessionBindingMismatchError,
   SessionClosingError,
   SessionNotFoundError,
+  type SessionBinding,
 } from "../agent-runtime.js";
 import { AcpPermissionBridge } from "./permission.js";
 import { AcpUpdateProjector } from "./projector.js";
 
-const ACP_CWD_METADATA = "acp.cwd";
+const ACP_BINDING_KIND = "acp.workspace";
 const DEFAULT_MAX_PENDING_UPDATES = 256;
 const DEFAULT_UPDATE_DELIVERY_TIMEOUT_MS = 10_000;
 
@@ -86,26 +88,30 @@ export function createAcpAgent(
       }, { once: true });
     })
     .onRequest(methods.agent.initialize, async () => {
-      const capabilities = await runtime.capabilities();
-      return {
-        protocolVersion: PROTOCOL_VERSION,
-        agentCapabilities: {
-          loadSession: false,
-          promptCapabilities: {},
-          sessionCapabilities: {
-            delete: {},
-            ...(capabilities.sessionResume ? { resume: {} } : {}),
+      try {
+        const capabilities = await runtime.capabilities();
+        return {
+          protocolVersion: PROTOCOL_VERSION,
+          agentCapabilities: {
+            loadSession: false,
+            promptCapabilities: {},
+            sessionCapabilities: {
+              delete: {},
+              ...(capabilities.sessionResume ? { resume: {} } : {}),
+            },
           },
-        },
-        authMethods: [],
-        agentInfo: implementation,
-      };
+          authMethods: [],
+          agentInfo: implementation,
+        };
+      } catch (error) {
+        throw toRequestError(error);
+      }
     })
     .onRequest(methods.agent.session.new, async ({ params }) => {
       await validateWorkspaceRequest(params, workspaceRoot);
       try {
         const created = await runtime.createSession({
-          metadata: { [ACP_CWD_METADATA]: workspaceRoot },
+          binding: acpSessionBinding(workspaceRoot),
         });
         return { sessionId: created.sessionId };
       } catch (error) {
@@ -115,13 +121,9 @@ export function createAcpAgent(
     .onRequest(methods.agent.session.resume, async ({ params }) => {
       await validateWorkspaceRequest(params, workspaceRoot);
       try {
-        await assertSessionWorkspace(runtime, params.sessionId, workspaceRoot, false);
-        const resumed = await runtime.resumeSession(params.sessionId);
-        // Re-check the returned snapshot so a delete/recreate race cannot cross
-        // the adapter boundary. Keep foreign and missing Sessions indistinguishable.
-        if (resumed.metadata[ACP_CWD_METADATA] !== workspaceRoot) {
-          throw RequestError.resourceNotFound(`session:${params.sessionId}`);
-        }
+        await runtime.resumeSession(params.sessionId, {
+          expectedBinding: acpSessionBinding(workspaceRoot),
+        });
         return {};
       } catch (error) {
         throw toRequestError(error, params.sessionId);
@@ -129,16 +131,20 @@ export function createAcpAgent(
     })
     .onRequest(methods.agent.session.delete, async ({ params }) => {
       try {
-        await assertSessionWorkspace(runtime, params.sessionId, workspaceRoot, true);
-        abortPrompts(activePrompts, params.sessionId, "Session deleted by ACP client");
-        await runtime.closeSession(params.sessionId);
+        await runtime.closeSession(params.sessionId, {
+          expectedBinding: acpSessionBinding(workspaceRoot),
+        });
         return {};
       } catch (error) {
+        if (error instanceof SessionBindingMismatchError) {
+          // Delete is idempotent: a foreign Session is projected exactly like
+          // an absent Session, without deleting or revealing its existence.
+          return {};
+        }
         throw toRequestError(error, params.sessionId);
       }
     })
     .onRequest(methods.agent.session.prompt, async (context) => {
-      await assertSessionWorkspace(runtime, context.params.sessionId, workspaceRoot, false);
       const controller = new AbortController();
       const detachRequestSignal = forwardAbort(context.signal, controller);
       const controllers = activePrompts.get(context.params.sessionId) ?? new Set();
@@ -158,6 +164,7 @@ export function createAcpAgent(
         const run = () => runtime.prompt({
           sessionId: context.params.sessionId,
           content: prompt,
+          expectedBinding: acpSessionBinding(workspaceRoot),
           signal: controller.signal,
           onEvent(event) {
             options.permissionBridge?.observe(event);
@@ -174,7 +181,7 @@ export function createAcpAgent(
         projector.ensureFinalText(result.content.map((part) => part.text).join(""), result.runId);
         await projector.drain();
         if (controller.signal.aborted) return { stopReason: "cancelled" };
-        return { stopReason: result.stopReason === "cancelled" ? "cancelled" : "end_turn" };
+        return { stopReason: "end_turn" };
       } catch (error) {
         // Runtime.close() aborts its internal controller, while ACP permission
         // requests use this outer scope. Close it before draining updates so a
@@ -203,30 +210,16 @@ export function createAcpAgent(
     .onNotification(methods.agent.session.cancel, ({ params }) => {
       if (!activePrompts.has(params.sessionId)) return;
       abortPrompts(activePrompts, params.sessionId, "Cancelled by ACP client");
-      runtime.cancel(params.sessionId, "Cancelled by ACP client");
+      runtime.cancel(
+        params.sessionId,
+        "Cancelled by ACP client",
+        { expectedBinding: acpSessionBinding(workspaceRoot) },
+      );
     });
 }
 
-async function assertSessionWorkspace(
-  runtime: AgentRuntime,
-  sessionId: string,
-  workspaceRoot: string,
-  allowMissing: boolean,
-): Promise<void> {
-  let session;
-  try {
-    session = await runtime.getSession(sessionId);
-  } catch (error) {
-    throw toRequestError(error, sessionId);
-  }
-  if (!session) {
-    if (allowMissing) return;
-    throw RequestError.resourceNotFound(`session:${sessionId}`);
-  }
-  if (session.metadata[ACP_CWD_METADATA] !== workspaceRoot) {
-    // Do not expose whether a foreign/unbound Session exists.
-    throw RequestError.resourceNotFound(`session:${sessionId}`);
-  }
+function acpSessionBinding(workspaceRoot: string): SessionBinding {
+  return { kind: ACP_BINDING_KIND, value: workspaceRoot };
 }
 
 function normalizePrompt(prompt: readonly ContentBlock[]): Array<{ type: "text"; text: string }> {
@@ -279,15 +272,15 @@ async function validateWorkspaceRequest(
     if (!(await stat(requestedRoot)).isDirectory()) {
       throw new Error("path is not a directory");
     }
-  } catch (error) {
+  } catch {
     throw RequestError.invalidParams(
-      { cwd: request.cwd, error: error instanceof Error ? error.message : String(error) },
+      { cwd: request.cwd },
       "cwd must resolve to an existing directory",
     );
   }
   if (requestedRoot !== workspaceRoot) {
     throw RequestError.invalidParams(
-      { configuredWorkspaceRoot: workspaceRoot, requestedCwd: requestedRoot },
+      { cwd: request.cwd },
       "cwd must resolve to the Agent's configured workspace root",
     );
   }
@@ -333,6 +326,10 @@ function toRequestError(error: unknown, sessionId?: string): RequestError {
   if (error instanceof SessionNotFoundError) {
     return RequestError.resourceNotFound(`session:${sessionId ?? "unknown"}`);
   }
+  if (error instanceof SessionBindingMismatchError) {
+    // Keep foreign and missing Sessions indistinguishable at the protocol boundary.
+    return RequestError.resourceNotFound(`session:${sessionId ?? "unknown"}`);
+  }
   if (error instanceof SessionClosingError) {
     return RequestError.invalidRequest(
       { sessionId },
@@ -342,9 +339,7 @@ function toRequestError(error: unknown, sessionId?: string): RequestError {
   if (error instanceof RuntimeClosedError) {
     return RequestError.internalError(undefined, "agent runtime is closed");
   }
-  return RequestError.internalError(
-    error instanceof Error ? { name: error.name, message: error.message } : { error: String(error) },
-  );
+  return RequestError.internalError(undefined, "agent runtime request failed");
 }
 
 function isAbortError(error: unknown): boolean {

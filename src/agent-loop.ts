@@ -59,6 +59,18 @@ export interface TurnExecutionResult {
   stopReason: "end_turn";
 }
 
+/** @internal */
+export interface PreparedSkillSelection {
+  readonly names: readonly string[];
+  readonly instructions: readonly string[];
+}
+
+/** @internal */
+export interface PreparedRuntimeTurn {
+  readonly input: RunTurnInput;
+  readonly skills: PreparedSkillSelection;
+}
+
 export type { RecoveryResult } from "./runtime/run-recovery.js";
 
 interface RunMutationGate {
@@ -76,6 +88,7 @@ export class AgentLoop {
   private readonly runFinalizer = new RunFinalizer();
   private readonly steering = new SteeringQueue();
   private readonly sessionTails = new Map<string, Promise<void>>();
+  private readonly preparedSkillSelections = new WeakSet<PreparedSkillSelection>();
 
   constructor(
     private readonly dependencies: {
@@ -125,6 +138,17 @@ export class AgentLoop {
     return this.enqueueSession(sessionId, () => this.recoverSessionSerialized(sessionId));
   }
 
+  /** Reserve FIFO order before Runtime performs asynchronous authorization. @internal */
+  recoverSessionDeferred(
+    sessionId: string,
+    authorize: () => Promise<void>,
+  ): Promise<RecoveryResult> {
+    return this.enqueueSession(sessionId, async () => {
+      await authorize();
+      return this.recoverSessionSerialized(sessionId);
+    });
+  }
+
   private async recoverSessionSerialized(sessionId: string): Promise<RecoveryResult> {
     const session = await this.dependencies.sessionStore.get(sessionId);
     const plan = this.runRecovery.plan(immutableSnapshot({
@@ -150,18 +174,66 @@ export class AgentLoop {
 
   async runTurnDetailed(input: RunTurnInput): Promise<TurnExecutionResult> {
     const request = snapshotRunTurnInput(input);
-    return this.enqueueSession(request.sessionId, () => this.runTurnSerialized(request));
+    return this.enqueueSession(request.sessionId, async () => {
+      const skills = await this.prepareSkillSelection(request.skills, request.signal);
+      this.consumePreparedSkillSelection(request, skills);
+      return this.runTurnSerialized(request, skills);
+    });
   }
 
-  private async runTurnSerialized(input: RunTurnInput): Promise<TurnExecutionResult> {
+  /** Resolve one immutable Skill snapshot for AgentRuntime admission. @internal */
+  async prepareSkillSelection(
+    names: readonly string[] | undefined,
+    signal?: AbortSignal,
+  ): Promise<PreparedSkillSelection> {
+    throwIfAborted(signal);
+    const selected = [...(names ?? [])];
+    assertUniqueNames("skill", selected);
+    let instructions: readonly string[] = [];
+    if (selected.length > 0) {
+      if (!this.dependencies.skillLoader) throw new Error("No SkillLoader configured");
+      const loaded = await this.dependencies.skillLoader.load(selected);
+      throwIfAborted(signal);
+      if (loaded.length !== selected.length
+        || loaded.some((skill, index) => skill.name !== selected[index])) {
+        throw new Error("SkillLoader returned a selection that does not match the request");
+      }
+      instructions = loaded.map((skill) => skill.instructions);
+    }
+    const snapshot = immutableSnapshot({ names: selected, instructions });
+    this.preparedSkillSelections.add(snapshot);
+    return snapshot;
+  }
+
+  /** Reserve FIFO order before Runtime resolves Session ownership and capabilities. @internal */
+  runTurnDetailedDeferred(
+    sessionId: string,
+    prepare: () => Promise<PreparedRuntimeTurn>,
+  ): Promise<TurnExecutionResult> {
+    return this.enqueueSession(sessionId, async () => {
+      const prepared = await prepare();
+      const request = snapshotRunTurnInput(prepared.input);
+      if (request.sessionId !== sessionId) {
+        throw new Error("Prepared Runtime Turn changed its reserved Session ID");
+      }
+      this.consumePreparedSkillSelection(request, prepared.skills);
+      return this.runTurnSerialized(request, prepared.skills);
+    });
+  }
+
+  private async runTurnSerialized(
+    input: RunTurnInput,
+    skills: PreparedSkillSelection,
+  ): Promise<TurnExecutionResult> {
     // A request cancelled before admission (including while waiting in the
     // per-session FIFO) must not create a Run or append a user message.
     throwIfAborted(input.signal);
     // Capability resolution is admission validation and must not mutate or
     // recover a Session when the requested scope itself is invalid.
-    const activeTools: ToolRegistry = input.tools
+    const activeTools = input.tools
       ? this.dependencies.tools.select(input.tools)
-      : this.dependencies.tools;
+      : this.dependencies.tools.snapshot();
+    const systemPrompt = this.buildSystemPrompt(input, skills.instructions);
     await this.recoverSessionSerialized(input.sessionId);
     const session = await this.dependencies.sessionStore.getOrCreate(input.sessionId);
     const rewroteLegacySummaries = demoteLegacyConversationSummaries(session.messages);
@@ -197,7 +269,6 @@ export class AgentLoop {
 
     try {
       throwIfAborted(input.signal);
-      const systemPrompt = await this.resolveSystemPrompt(input);
       for (let round = 0; round < this.maxToolRounds; round += 1) {
         throwIfAborted(input.signal);
         const modelRequest = await this.prepareModelRequest(
@@ -305,6 +376,17 @@ export class AgentLoop {
     }
   }
 
+  private consumePreparedSkillSelection(
+    input: RunTurnInput,
+    skills: PreparedSkillSelection,
+  ): void {
+    if (!this.preparedSkillSelections.has(skills)
+      || !sameNames(input.skills, skills.names)) {
+      throw new Error("Prepared Skill selection does not match this AgentLoop Turn");
+    }
+    this.preparedSkillSelections.delete(skills);
+  }
+
   private async enqueueSession<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.sessionTails.get(sessionId) ?? Promise.resolve();
     let release!: () => void;
@@ -320,13 +402,10 @@ export class AgentLoop {
     }
   }
 
-  private async resolveSystemPrompt(input: RunTurnInput): Promise<string> {
-    const skillInstructions: string[] = [];
-    if (input.skills?.length) {
-      if (!this.dependencies.skillLoader) throw new Error("No SkillLoader configured");
-      const loaded = await this.dependencies.skillLoader.load(input.skills);
-      skillInstructions.push(...loaded.map((skill) => skill.instructions));
-    }
+  private buildSystemPrompt(
+    input: RunTurnInput,
+    skillInstructions: readonly string[],
+  ): string {
     return this.modelRequestPlanner.buildPrompt(immutableSnapshot({
       promptInjections: input.promptInjections ?? [],
       skillInstructions,
@@ -495,6 +574,21 @@ export class AgentLoop {
     };
     return Object.freeze({ checkpoint });
   }
+}
+
+function assertUniqueNames(kind: string, names: readonly string[]): void {
+  if (new Set(names).size !== names.length) {
+    throw new Error(`Duplicate ${kind} capability`);
+  }
+}
+
+function sameNames(
+  left: readonly string[] | undefined,
+  right: readonly string[],
+): boolean {
+  const normalized = left ?? [];
+  return normalized.length === right.length
+    && normalized.every((name, index) => name === right[index]);
 }
 
 function createRunState(): RunState {

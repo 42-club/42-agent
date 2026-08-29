@@ -35,7 +35,8 @@ runtime process.
 - Provider payloads, transport messages, and UI state are not canonical session state.
 - Runtime DTOs, Model requests, Tool arguments, progress events, and session-read-only Tool contexts must
   be detached from canonical state. Reserved capability metadata cannot be supplied or mutated through
-  generic metadata.
+  generic metadata. Protocol ownership belongs in a protected Runtime binding and must be checked atomically
+  with admission, control, recovery, and deletion rather than in a preceding adapter read.
 
 Preserve a single canonical execution model. New transports and protocols should adapt to it instead of
 creating parallel agent loops.
@@ -76,6 +77,9 @@ protocol-level conformance tests for the supported version and capabilities.
   External side-effect ordering is separate: use `executionPolicy: "exclusive"` without granting Session
   mutation; only overlap tools that are explicitly safe to reorder. Tool scheduling may request a checkpoint
   only through the private mutation gate supplied by `AgentLoop`; it must not regain direct Store access.
+- Resolve Tool membership/definitions/policy and Skill instructions into immutable per-Turn snapshots.
+  Registry refreshes affect later Turns only, and Runtime validation must not load a Skill again during
+  Loop execution.
 - `skills.ts` supplies optional instructions; skills do not own tools, permissions, sessions, or transports.
 - `mcp.ts` adapts MCP tools to the local Tool interface. MCP supplies agent capabilities; ACP exposes and
   controls an agent from its client. Keep these responsibilities distinct.
@@ -87,6 +91,8 @@ protocol-level conformance tests for the supported version and capabilities.
 ## Concurrency and durability
 
 - Serialize turns and explicit recovery through the same FIFO per session within one runtime process.
+- Reserve FIFO position before asynchronous Session, ownership, or capability preflight; authorization for
+  a queued operation must observe all preceding Turn mutations inside that same serialized position.
 - Allow different sessions and different runtime processes to execute concurrently.
 - Session close must gate new work, cancel admitted work, join every started operation, and only then
   delete state. Global and per-Session close must publish one shared promise before triggering abort

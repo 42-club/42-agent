@@ -3,7 +3,9 @@
 `AgentRuntime` is the protocol-neutral host boundary. All protocol/channel turns pass through it for
 session lifecycle, capability selection, cancellation, and close admission. It derives the canonical
 `SessionStore`, `ToolRegistry`, and Skill loader from `AgentLoop`; supplying different instances is rejected at
-construction. `AgentLoop`, its per-session coordinator, and that Store are the only source of truth for
+construction. A constructed Runtime is ready for use immediately, with `close()` as its terminal lifecycle
+transition.
+`AgentLoop`, its per-session coordinator, and that Store are the only source of truth for
 conversation and run state.
 The core Runtime does not bind Sessions to channels. A protocol adapter may still enforce admission and
 ownership before resolving an inbound event to a Session ID; ACP, in particular, accepts only ACP-bound
@@ -49,6 +51,8 @@ runtime/* policy plans ─┘
 - `skills.ts`: Load optional instructions. A Skill does not own tools, permissions, or sessions.
 - `mcp.ts`: Convert MCP tools into the same Tool interface used by local tools, apply host-owned trust and
   ordering policy, normalize failures, and own refresh/close lifecycle when using `MCPToolProvider`.
+- `legacy/`: Isolate deprecated compatibility APIs that can bypass current coordination invariants. It is
+  never re-exported by the core or `runtime/` barrels.
 - `session.ts`: Canonical messages and durable `RunState`/`ToolCallState`.
 - `agent-loop.ts`: The only core coordinator allowed to admit conversation and run-state mutations. It
   applies policy plans and remains responsible for FIFO admission, live state, tool authorization,
@@ -84,10 +88,12 @@ transport and Runtime lifecycle; each `AgentApp` enforces one live ACP client co
 
 `workspaceRoot` is mandatory and is canonicalized with `realpath`. A session request's `cwd` must resolve
 to that same host-enforced root; symlink aliases are accepted only when their canonical target matches.
-The adapter records the root in Session metadata and verifies it on resume, prompt, and delete. Existing
-Sessions with missing or foreign-root metadata are rejected without disclosing their ownership; missing
-resume/prompt targets fail while delete remains idempotent. Cancel targets only prompts admitted by this
-adapter, and protocol input never widens Tool roots.
+The adapter stores the root as a protected Runtime binding that generic metadata cannot forge. Resume,
+prompt, cancel, and delete check that binding inside the same Runtime admission/close gate as the operation,
+including a final re-check immediately before deletion. Existing Sessions with missing or foreign bindings
+are rejected without disclosing their ownership; missing resume/prompt targets fail while delete remains
+idempotent. Cancel targets only prompts admitted with the same binding, and protocol input never widens
+Tool roots.
 
 Update projection has a bounded pending count and per-delivery timeout. Backpressure, timeout, transport
 failure, request cancellation, session cancellation/deletion, and Runtime shutdown all terminate the
@@ -103,7 +109,9 @@ adapter boundary rather than ignored or injected into the Runtime.
 
 ## Concurrency
 
-Turns and explicit recovery are serialized FIFO per session within one runtime process. Session close
+Turns and explicit recovery are serialized FIFO per session within one runtime process. Runtime reserves
+that FIFO position before asynchronous Session lookup, binding checks, or Skill loading, so a later fast
+request cannot overtake an earlier request or decide its initial capability scope. Session close
 gates new work, cooperatively cancels admitted turns, waits for them to settle, and only then deletes state.
 Different sessions and independent runtime processes remain concurrent.
 Cancellation is checked again after a request waits for its FIFO slot: work cancelled before admission does
@@ -189,10 +197,10 @@ Three extracted policy objects reduce `AgentLoop` size without creating alternat
 publishes the corresponding event. This preserves one mutation-admission path and keeps durable state ahead
 of observer-visible terminal outcomes. For tool batches it creates a private per-Run `RunMutationGate` that
 couples each admitted mutation to a serialized checkpoint. The internal coordinated executor receives this
-narrow gate instead of `SessionStore`; policy objects never receive either one. The deprecated exported
-`ToolExecutor` is a compatibility facade for its original direct-construction API and is not part of the
-Loop's mutation path. Trusted write tools may still access the live Session only within their exclusive
-Loop-authorized barrier.
+narrow gate instead of `SessionStore`; policy objects never receive either one. The deprecated
+`ToolExecutor` is available only through the explicit `42-agent/legacy` compatibility entry point. It is
+not exported by the package root or the `runtime/` barrel and is not part of the Loop's mutation path.
+Trusted write tools may still access the live Session only within their exclusive Loop-authorized barrier.
 
 ## Safe recovery
 
@@ -241,3 +249,8 @@ type-checking, and the coverage-gated test run.
 The package is licensed under Apache-2.0 and configured for public npm publication. Public releases use
 semantic versions and require an explicit maintainer publish action; CI and `npm pack --dry-run` verify
 the artifact without publishing it.
+
+The package root is the protocol-neutral core. ACP, Channel, provider, storage, concrete Tool, MCP, and
+legacy compatibility APIs are exposed only through explicit package subpaths. This keeps importing the
+core from eagerly evaluating optional adapter dependency graphs and prevents internal Runtime policy
+objects from becoming accidental compatibility commitments.

@@ -1,4 +1,6 @@
 export * from "./types.js";
+export { FileSessionStore, SessionPathCollisionError } from "../session-file.js";
+export { SqliteSessionStore } from "../session-sqlite.js";
 export { resolveSessionDatabaseConfig } from "./config.js";
 export { openSessionStore } from "./factory.js";
 export {

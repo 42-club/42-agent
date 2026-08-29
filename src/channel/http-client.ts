@@ -1,6 +1,6 @@
 import type { AgentLoopEvent } from "../runtime/events.js";
 import type { RuntimeStopReason } from "../agent-runtime.js";
-import type { TurnRequest } from "../service/runtime-http-server.js";
+import type { TurnRequest } from "./runtime-http-server.js";
 
 export type RuntimeStreamItem =
   | { type: "event"; event: AgentLoopEvent }
@@ -11,7 +11,7 @@ export type RuntimeStreamItem =
     stopReason: RuntimeStopReason;
     content: string;
   }
-  | { type: "error"; message: string };
+  | { type: "error"; code: string; message: string };
 
 export async function* streamRuntimeTurn(
   baseUrl: string,

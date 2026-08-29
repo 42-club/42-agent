@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  AgentLoop, ConversationCompressionTool, EventDispatcher, InMemorySessionStore,
-  ToolExecutor, ToolRegistry,
+  AgentLoop, InMemorySessionStore, ToolRegistry,
   createMessage, type ModelClient, type SaveSessionOptions, type Session,
   type RunState, type SessionStore, type Tool,
 } from "../src/index.js";
+import { EventDispatcher, ToolExecutor } from "../src/legacy/index.js";
+import { ConversationCompressionTool } from "../src/tools/index.js";
 
 class FailOneSaveStore implements SessionStore {
   private saves = 0;

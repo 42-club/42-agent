@@ -2,15 +2,17 @@ import { resolve } from "node:path";
 import {
   AgentLoop,
   AgentRuntime,
-  ConversationCompressionTool,
   ToolRegistry,
-  createAgentRuntimeHttpServer,
-  createAiSdkOpenRouterClient,
+} from "../src/index.js";
+import { createAgentRuntimeHttpServer } from "../src/channel/index.js";
+import { createAiSdkOpenRouterClient } from "../src/provider/index.js";
+import {
   openSessionStore,
   resolveSessionDatabaseConfig,
   type PostgresSchemaMode,
   type SessionDatabaseConfig,
-} from "../src/index.js";
+} from "../src/storage/index.js";
+import { ConversationCompressionTool } from "../src/tools/index.js";
 
 const apiKey = process.env.OPENROUTER_API_KEY ?? "";
 if (!apiKey) throw new Error("OPENROUTER_API_KEY is required");

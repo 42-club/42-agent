@@ -3,7 +3,6 @@ import test from "node:test";
 import {
   AgentLoop,
   AgentRuntime,
-  ConversationCompressionTool,
   InMemorySessionStore,
   ToolRegistry,
   type LoadedSkill,
@@ -13,8 +12,11 @@ import {
   type SessionStore,
   type Tool,
 } from "../src/index.js";
+import { ConversationCompressionTool } from "../src/tools/index.js";
 
 class TestSkillCatalog implements SkillCatalog {
+  loadCalls = 0;
+
   private readonly skills = new Map<string, LoadedSkill>([
     ["review", {
       name: "review",
@@ -29,6 +31,7 @@ class TestSkillCatalog implements SkillCatalog {
   }
 
   async load(names: readonly string[]) {
+    this.loadCalls += 1;
     return names.map((name) => {
       const skill = this.skills.get(name);
       if (!skill) throw new Error(`Unknown skill: ${name}`);
@@ -56,7 +59,11 @@ function createRuntime(model: ModelClient) {
     skillLoader: skills,
     requestApproval: async () => false,
   });
-  return { runtime: new AgentRuntime({ loop, sessionStore, tools, skills }), sessionStore };
+  return {
+    runtime: new AgentRuntime({ loop, sessionStore, tools, skills }),
+    sessionStore,
+    skills,
+  };
 }
 
 test("AgentRuntime exposes protocol-neutral lifecycle and scoped capabilities", async () => {
@@ -83,8 +90,8 @@ test("AgentRuntime exposes protocol-neutral lifecycle and scoped capabilities", 
     metadata: { owner: "host-application" },
   });
   assert.equal(created.created, true);
-  assert.deepEqual(created.tools, ["echo"]);
-  assert.deepEqual(created.skills, ["review"]);
+  assert.deepEqual(created.tools, { mode: "selected", names: ["echo"] });
+  assert.deepEqual(created.skills, { mode: "selected", names: ["review"] });
 
   const result = await runtime.prompt({
     sessionId: created.sessionId,
@@ -113,6 +120,155 @@ test("AgentRuntime reports streaming only when the canonical model supports it",
   };
 
   assert.equal((await createRuntime(model).runtime.capabilities()).streaming, true);
+});
+
+test("AgentRuntime resolves one Skill snapshot for an atomic create-and-prompt", async () => {
+  const model: ModelClient = {
+    async complete({ systemPrompt }) {
+      assert.match(systemPrompt, /Review carefully/);
+      return { content: "done" };
+    },
+  };
+  const { runtime, skills } = createRuntime(model);
+
+  const result = await runtime.prompt({
+    sessionId: "skill-snapshot",
+    content: [{ type: "text", text: "review" }],
+    createIfMissing: true,
+    skills: ["review"],
+  });
+
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(skills.loadCalls, 1);
+});
+
+test("Skill resolution preserves a custom AbortSignal reason", async () => {
+  let markLoading!: () => void;
+  const loading = new Promise<void>((resolve) => { markLoading = resolve; });
+  let releaseLoad!: () => void;
+  const release = new Promise<void>((resolve) => { releaseLoad = resolve; });
+  const skills: SkillCatalog = {
+    async list() {
+      return [{ name: "slow", description: "Slow Skill" }];
+    },
+    async load() {
+      markLoading();
+      await release;
+      return [{
+        name: "slow",
+        description: "Slow Skill",
+        instructions: "Wait carefully.",
+        path: "memory:slow",
+      }];
+    },
+  };
+  const sessionStore = new InMemorySessionStore();
+  const loop = new AgentLoop({
+    model: { async complete() { return { content: "unused" }; } },
+    sessionStore,
+    tools: new ToolRegistry(),
+    skillLoader: skills,
+    requestApproval: async () => false,
+  });
+  const runtime = new AgentRuntime({ loop });
+  const controller = new AbortController();
+  const reason = new Error("custom cancellation");
+  const pending = runtime.prompt({
+    sessionId: "cancel-skill-resolution",
+    content: [{ type: "text", text: "go" }],
+    createIfMissing: true,
+    skills: ["slow"],
+    signal: controller.signal,
+  });
+
+  await loading;
+  controller.abort(reason);
+  releaseLoad();
+  await assert.rejects(pending, (error) => error === reason);
+  assert.equal(await sessionStore.get("cancel-skill-resolution"), undefined);
+});
+
+test("Runtime reserves FIFO order before asynchronous Skill and Session admission", async () => {
+  let markFirstLoad!: () => void;
+  const firstLoad = new Promise<void>((resolve) => { markFirstLoad = resolve; });
+  let releaseFirstLoad!: () => void;
+  const release = new Promise<void>((resolve) => { releaseFirstLoad = resolve; });
+  let loads = 0;
+  const skills: SkillCatalog = {
+    async list() {
+      return [{ name: "slow", description: "Slow Skill" }];
+    },
+    async load(names) {
+      loads += 1;
+      if (loads === 1) {
+        markFirstLoad();
+        await release;
+      }
+      return names.map((name) => ({
+        name,
+        description: "Slow Skill",
+        instructions: "First request instructions.",
+        path: `memory:${name}`,
+      }));
+    },
+  };
+  const observed: string[] = [];
+  const sessionStore = new InMemorySessionStore();
+  const loop = new AgentLoop({
+    model: {
+      async complete({ messages }) {
+        observed.push(messages.at(-1)?.content ?? "");
+        return { content: "done" };
+      },
+    },
+    sessionStore,
+    tools: new ToolRegistry(),
+    skillLoader: skills,
+    requestApproval: async () => false,
+  });
+  const runtime = new AgentRuntime({ loop });
+
+  const first = runtime.prompt({
+    sessionId: "preflight-fifo",
+    content: [{ type: "text", text: "first" }],
+    createIfMissing: true,
+    skills: ["slow"],
+  });
+  await firstLoad;
+  const second = runtime.prompt({
+    sessionId: "preflight-fifo",
+    content: [{ type: "text", text: "second" }],
+    createIfMissing: true,
+    skills: [],
+  });
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(observed, []);
+  assert.equal(await sessionStore.get("preflight-fifo"), undefined);
+
+  releaseFirstLoad();
+  await Promise.all([first, second]);
+  assert.deepEqual(observed, ["first", "second"]);
+  assert.deepEqual(
+    (await runtime.getSession("preflight-fifo"))?.skills,
+    { mode: "selected", names: ["slow"] },
+  );
+});
+
+test("AgentRuntime is ready after construction and lifecycle queries reject after close", async () => {
+  const model: ModelClient = {
+    async complete() {
+      return { content: "unused" };
+    },
+  };
+  const { runtime } = createRuntime(model);
+
+  assert.equal((await runtime.capabilities()).sessionResume, true);
+  await runtime.close();
+  await assert.rejects(runtime.capabilities(), { name: "RuntimeClosedError" });
+  await assert.rejects(
+    runtime.createSession({ sessionId: "after-close" }),
+    { name: "RuntimeClosedError" },
+  );
 });
 
 test("AgentRuntime cancels an active prompt by session ID", async () => {
@@ -395,6 +551,276 @@ test("AgentRuntime prevents a turn from widening session capabilities", async ()
   );
 });
 
+test("Session capability scopes distinguish unrestricted from selected-empty", async () => {
+  const { runtime } = createRuntime({ async complete() { return { content: "unused" }; } });
+
+  const unrestricted = await runtime.createSession({ sessionId: "scope-all" });
+  assert.deepEqual(unrestricted.tools, { mode: "all" });
+  assert.deepEqual(unrestricted.skills, { mode: "all" });
+
+  const empty = await runtime.createSession({
+    sessionId: "scope-empty",
+    tools: [],
+    skills: [],
+  });
+  assert.deepEqual(empty.tools, { mode: "selected", names: [] });
+  assert.deepEqual(empty.skills, { mode: "selected", names: [] });
+});
+
+test("malformed persisted capability scopes are rejected instead of widening access", async () => {
+  let modelCalls = 0;
+  const { runtime, sessionStore } = createRuntime({
+    async complete() {
+      modelCalls += 1;
+      return { content: "must not run" };
+    },
+  });
+  await sessionStore.create("malformed-tools", { "runtime.tools": { allow: "all" } });
+  await sessionStore.create("malformed-skills", { "runtime.skills": ["review", 42] });
+
+  await assert.rejects(
+    runtime.prompt({
+      sessionId: "malformed-tools",
+      content: [{ type: "text", text: "go" }],
+    }),
+    { name: "InvalidSessionCapabilityScopeError" },
+  );
+  await assert.rejects(
+    runtime.resumeSession("malformed-skills"),
+    { name: "InvalidSessionCapabilityScopeError" },
+  );
+  assert.equal(modelCalls, 0);
+});
+
+test("reserved Session binding cannot be forged through generic metadata", async () => {
+  const { runtime, sessionStore } = createRuntime({
+    async complete() { return { content: "done" }; },
+  });
+  const binding = { kind: "test-adapter", value: "owner-a" };
+  const created = await runtime.createSession({
+    sessionId: "protected-binding",
+    binding,
+    metadata: {
+      "runtime.binding": { kind: "test-adapter", value: "forged-owner" },
+      visible: "kept",
+    },
+  });
+
+  assert.equal(created.metadata["runtime.binding"], undefined);
+  assert.equal(created.metadata.visible, "kept");
+  assert.deepEqual(
+    (await sessionStore.get("protected-binding"))?.metadata["runtime.binding"],
+    binding,
+  );
+
+  const forgedOnly = await runtime.createSession({
+    sessionId: "forged-binding-only",
+    metadata: { "runtime.binding": binding },
+  });
+  assert.equal(forgedOnly.metadata["runtime.binding"], undefined);
+  assert.equal(
+    (await sessionStore.get("forged-binding-only"))?.metadata["runtime.binding"],
+    undefined,
+  );
+  await assert.rejects(
+    runtime.resumeSession("forged-binding-only", { expectedBinding: binding }),
+    { name: "SessionBindingMismatchError" },
+  );
+});
+
+test("expected Session binding gates prompt, resume, and close", async () => {
+  let modelCalls = 0;
+  const { runtime, sessionStore } = createRuntime({
+    async complete() {
+      modelCalls += 1;
+      return { content: "done" };
+    },
+  });
+  const binding = { kind: "test-adapter", value: "owner-a" };
+  const foreign = { kind: "test-adapter", value: "owner-b" };
+  await runtime.createSession({ sessionId: "binding-gate", binding });
+
+  await assert.rejects(
+    runtime.resumeSession("binding-gate"),
+    { name: "SessionBindingMismatchError" },
+  );
+  await assert.rejects(
+    runtime.recoverSession("binding-gate"),
+    { name: "SessionBindingMismatchError" },
+  );
+  await assert.rejects(
+    runtime.resumeSession("binding-gate", { expectedBinding: foreign }),
+    { name: "SessionBindingMismatchError" },
+  );
+  await assert.rejects(
+    runtime.prompt({
+      sessionId: "binding-gate",
+      content: [{ type: "text", text: "missing owner" }],
+    }),
+    { name: "SessionBindingMismatchError" },
+  );
+  await assert.rejects(
+    runtime.prompt({
+      sessionId: "binding-gate",
+      expectedBinding: foreign,
+      content: [{ type: "text", text: "must not append" }],
+    }),
+    { name: "SessionBindingMismatchError" },
+  );
+  assert.equal(modelCalls, 0);
+  assert.deepEqual((await sessionStore.get("binding-gate"))?.messages, []);
+
+  assert.equal((await runtime.resumeSession("binding-gate", {
+    expectedBinding: binding,
+  })).created, false);
+  assert.deepEqual(
+    await runtime.recoverSession("binding-gate", { expectedBinding: binding }),
+    { recovered: false, interruptedToolCalls: 0 },
+  );
+  assert.equal((await runtime.prompt({
+    sessionId: "binding-gate",
+    expectedBinding: binding,
+    content: [{ type: "text", text: "allowed" }],
+  })).stopReason, "end_turn");
+  assert.equal(modelCalls, 1);
+
+  await assert.rejects(
+    runtime.closeSession("binding-gate", { expectedBinding: foreign }),
+    { name: "SessionBindingMismatchError" },
+  );
+  assert.ok(await sessionStore.get("binding-gate"));
+  assert.equal(await runtime.closeSession("binding-gate", { expectedBinding: binding }), true);
+  assert.equal(await runtime.closeSession("binding-gate", { expectedBinding: binding }), false);
+});
+
+test("missing or foreign binding cannot cancel or close an authorized active Turn", async () => {
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  let finishModel!: () => void;
+  const finish = new Promise<void>((resolve) => { finishModel = resolve; });
+  let aborted = false;
+  const { runtime, sessionStore } = createRuntime({
+    async complete(request) {
+      markStarted();
+      request.signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
+      await finish;
+      return { content: "done" };
+    },
+  });
+  const binding = { kind: "test-adapter", value: "owner-a" };
+  const foreign = { kind: "test-adapter", value: "owner-b" };
+  await runtime.createSession({ sessionId: "bound-active", binding });
+  const running = runtime.prompt({
+    sessionId: "bound-active",
+    expectedBinding: binding,
+    content: [{ type: "text", text: "wait" }],
+  });
+  await started;
+
+  assert.equal(runtime.cancel("bound-active"), false);
+  assert.equal(runtime.cancel("bound-active", "foreign", { expectedBinding: foreign }), false);
+  assert.equal(runtime.steer("bound-active", "foreign steering"), false);
+  await assert.rejects(
+    runtime.closeSession("bound-active"),
+    { name: "SessionBindingMismatchError" },
+  );
+  assert.equal(aborted, false);
+  assert.equal(runtime.activeRuns("bound-active").length, 1);
+
+  finishModel();
+  assert.equal((await running).stopReason, "end_turn");
+  assert.equal((await sessionStore.get("bound-active"))?.runState?.status, "completed");
+  assert.equal(await runtime.closeSession("bound-active", { expectedBinding: binding }), true);
+});
+
+test("cancelling an unvalidated foreign prompt cannot clear authorized steering", async () => {
+  let markModelStarted!: () => void;
+  const modelStarted = new Promise<void>((resolve) => { markModelStarted = resolve; });
+  let releaseModel!: () => void;
+  const release = new Promise<void>((resolve) => { releaseModel = resolve; });
+  let modelCalls = 0;
+  const { runtime } = createRuntime({
+    async complete({ messages }) {
+      modelCalls += 1;
+      if (modelCalls === 1) {
+        markModelStarted();
+        await release;
+        return { content: "initial" };
+      }
+      assert.equal(messages.at(-1)?.content, "keep direction");
+      return { content: "steered" };
+    },
+  });
+  const binding = { kind: "test-adapter", value: "owner-a" };
+  const foreignBinding = { kind: "test-adapter", value: "owner-b" };
+  await runtime.createSession({ sessionId: "foreign-cancel-steering", binding });
+  const authorized = runtime.prompt({
+    sessionId: "foreign-cancel-steering",
+    expectedBinding: binding,
+    content: [{ type: "text", text: "start" }],
+  });
+  await modelStarted;
+  assert.equal(runtime.steer(
+    "foreign-cancel-steering",
+    "keep direction",
+    { expectedBinding: binding },
+  ), true);
+
+  const foreign = runtime.prompt({
+    sessionId: "foreign-cancel-steering",
+    expectedBinding: foreignBinding,
+    content: [{ type: "text", text: "foreign" }],
+  });
+  assert.equal(runtime.cancel(
+    "foreign-cancel-steering",
+    "cancel foreign",
+    { expectedBinding: foreignBinding },
+  ), true);
+  releaseModel();
+
+  assert.equal((await authorized).content[0]?.text, "steered");
+  await assert.rejects(foreign, { name: "AbortError" });
+});
+
+test("an in-flight Session close can only be joined by the same binding", async () => {
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  let releaseModel!: () => void;
+  const release = new Promise<void>((resolve) => { releaseModel = resolve; });
+  const { runtime } = createRuntime({
+    async complete() {
+      markStarted();
+      await release;
+      return { content: "too late" };
+    },
+  });
+  const binding = { kind: "test-adapter", value: "owner-a" };
+  await runtime.createSession({ sessionId: "binding-close-join", binding });
+  const running = runtime.prompt({
+    sessionId: "binding-close-join",
+    expectedBinding: binding,
+    content: [{ type: "text", text: "wait" }],
+  });
+  await started;
+
+  const closing = runtime.closeSession("binding-close-join", { expectedBinding: binding });
+  const joined = runtime.closeSession("binding-close-join", { expectedBinding: binding });
+  await assert.rejects(
+    runtime.closeSession("binding-close-join"),
+    { name: "SessionBindingMismatchError" },
+  );
+  await assert.rejects(
+    runtime.prompt({
+      sessionId: "binding-close-join",
+      content: [{ type: "text", text: "foreign during close" }],
+    }),
+    { name: "SessionBindingMismatchError" },
+  );
+  releaseModel();
+  await assert.rejects(running, { name: "AbortError" });
+  assert.deepEqual(await Promise.all([closing, joined]), [true, true]);
+});
+
 test("duplicate capability scopes are rejected before creating or mutating a session", async () => {
   const model: ModelClient = { async complete() { return { content: "unused" }; } };
   const { runtime, sessionStore } = createRuntime(model);
@@ -629,12 +1055,14 @@ test("SessionInfo is detached from canonical metadata and capability scope", asy
 
   metadata.profile.role = "changed-input";
   (created.metadata.profile as { role: string }).role = "changed-output";
-  (created.metadata["runtime.tools"] as string[]).push("compress_conversation");
-  (created.tools as string[]).push("compress_conversation");
+  assert.equal(created.metadata["runtime.tools"], undefined);
+  if (created.tools.mode === "selected") {
+    (created.tools.names as string[]).push("compress_conversation");
+  }
 
   const resumed = await runtime.resumeSession("detached-session-info");
   assert.deepEqual(resumed.metadata.profile, { role: "owner" });
-  assert.deepEqual(resumed.tools, ["echo"]);
+  assert.deepEqual(resumed.tools, { mode: "selected", names: ["echo"] });
   await assert.rejects(
     runtime.prompt({
       sessionId: "detached-session-info",
@@ -648,7 +1076,7 @@ test("SessionInfo is detached from canonical metadata and capability scope", asy
     sessionId: "reserved-metadata",
     metadata: { "runtime.tools": ["compress_conversation"] },
   });
-  assert.deepEqual(reserved.tools, []);
+  assert.deepEqual(reserved.tools, { mode: "all" });
   assert.equal(reserved.metadata["runtime.tools"], undefined);
 });
 
@@ -672,7 +1100,7 @@ test("Runtime snapshots mutable request inputs at admission", async () => {
   metadata.nested.owner = "caller mutation";
 
   const created = await creating;
-  assert.deepEqual(created.tools, ["echo"]);
+  assert.deepEqual(created.tools, { mode: "selected", names: ["echo"] });
   assert.deepEqual(created.metadata.nested, { owner: "original" });
 
   const turnTools = ["echo"];
@@ -720,4 +1148,38 @@ test("live recovery is serialized behind the active turn", async () => {
   const session = await sessionStore.get("live-recovery");
   assert.equal(session?.runState?.status, "completed");
   assert.equal(session?.messages.some((message) => /InterruptedToolCall/.test(message.content)), false);
+});
+
+test("Session close cancels an active Turn before awaiting queued recovery", async () => {
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  let releaseModel!: () => void;
+  const release = new Promise<void>((resolve) => { releaseModel = resolve; });
+  let aborted = false;
+  const { runtime } = createRuntime({
+    async complete({ signal }) {
+      markStarted();
+      signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
+      // Ignore cancellation until released so the ordering is observable.
+      await release;
+      return { content: "too late" };
+    },
+  });
+  await runtime.createSession({ sessionId: "close-beats-recovery" });
+  const running = runtime.prompt({
+    sessionId: "close-beats-recovery",
+    content: [{ type: "text", text: "wait" }],
+  });
+  await started;
+  const recovery = runtime.recoverSession("close-beats-recovery");
+  const closing = runtime.closeSession("close-beats-recovery");
+
+  for (let attempt = 0; attempt < 20 && !aborted; attempt += 1) {
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+  }
+  assert.equal(aborted, true);
+  releaseModel();
+  await assert.rejects(running, { name: "AbortError" });
+  assert.deepEqual(await recovery, { recovered: false, interruptedToolCalls: 0 });
+  assert.equal(await closing, true);
 });

@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import type { AgentLoop, RecoveryResult } from "./agent-loop.js";
+import type {
+  AgentLoop,
+  PreparedSkillSelection,
+  RecoveryResult,
+} from "./agent-loop.js";
 import type { AgentLoopEvent, AgentLoopEventHandler } from "./runtime/events.js";
 import { throwIfAborted } from "./runtime/retry.js";
 import { assertValidSessionId, SessionAlreadyExistsError, type Session, type SessionStore } from "./session.js";
@@ -12,22 +16,39 @@ export interface TextContentPart {
 }
 
 export type RuntimeContentPart = TextContentPart;
-export type RuntimeStopReason = "end_turn" | "cancelled" | "error";
+/** Successful Runtime Turns resolve only after reaching the canonical end-turn state. */
+export type RuntimeStopReason = "end_turn";
+
+/** Protocol-neutral ownership token assigned by a trusted session adapter. */
+export interface SessionBinding {
+  kind: string;
+  value: string;
+}
+
+export type CapabilityScope =
+  | { mode: "all" }
+  | { mode: "selected"; names: readonly string[] };
 
 export interface CreateSessionInput {
   sessionId?: string;
   skills?: readonly string[];
   tools?: readonly string[];
   metadata?: Record<string, unknown>;
+  /** Reserved ownership data. Generic metadata cannot set or replace it. */
+  binding?: SessionBinding;
 }
 
 export interface SessionInfo {
   sessionId: string;
   created: boolean;
   metadata: Record<string, unknown>;
-  skills: readonly string[];
-  tools: readonly string[];
+  skills: CapabilityScope;
+  tools: CapabilityScope;
   activeRunIds: readonly string[];
+}
+
+export interface SessionAccessOptions {
+  expectedBinding?: SessionBinding;
 }
 
 export interface PromptInput {
@@ -39,6 +60,7 @@ export interface PromptInput {
   tools?: readonly string[];
   promptInjections?: readonly string[];
   metadata?: Record<string, unknown>;
+  expectedBinding?: SessionBinding;
   signal?: AbortSignal;
   onEvent?: AgentLoopEventHandler;
 }
@@ -81,13 +103,14 @@ interface ResolvedAgentRuntimeDependencies {
   loop: AgentLoop;
   sessionStore: SessionStore;
   tools: ToolRegistry;
-  skillLoader?: SkillLoader;
   skills?: SkillCatalog;
   onEvent?: AgentLoopEventHandler;
 }
 
 interface ActiveRun {
   controller: AbortController;
+  expectedBinding?: SessionBinding;
+  bindingValidated: boolean;
   runId?: string;
   status: "queued" | "running";
   terminal: boolean;
@@ -97,20 +120,33 @@ interface ActiveRun {
 }
 
 interface PendingSessionOperation {
+  /** FIFO-bound recovery may wait behind a Turn that close must cancel first. */
+  waitBeforeCancel: boolean;
   settled: Promise<void>;
   resolveSettled: () => void;
 }
 
+interface ClosingSession {
+  expectedBinding?: SessionBinding;
+  promise: Promise<boolean>;
+}
+
+interface ResolvedPromptSession {
+  session: Session;
+  preparedSkills?: PreparedSkillSelection;
+}
+
 const SESSION_SKILLS = "runtime.skills";
 const SESSION_TOOLS = "runtime.tools";
+const SESSION_BINDING = "runtime.binding";
+const RESERVED_SESSION_METADATA = [SESSION_SKILLS, SESSION_TOOLS, SESSION_BINDING] as const;
 
 /** Protocol-neutral lifecycle facade used by ACP, HTTP, CLI, and embedded hosts. */
 export class AgentRuntime {
   private readonly dependencies: ResolvedAgentRuntimeDependencies;
   private readonly active = new Map<string, Set<ActiveRun>>();
   private readonly sessionOperations = new Map<string, Set<PendingSessionOperation>>();
-  private readonly closingSessions = new Map<string, Promise<boolean>>();
-  private started = false;
+  private readonly closingSessions = new Map<string, ClosingSession>();
   private closed = false;
   private closing?: Promise<void>;
 
@@ -131,15 +167,9 @@ export class AgentRuntime {
       loop: dependencies.loop,
       sessionStore,
       tools,
-      skillLoader,
       skills: isSkillCatalog(skillLoader) ? skillLoader : undefined,
       onEvent: dependencies.onEvent,
     };
-  }
-
-  async start(): Promise<void> {
-    if (this.closed) throw new RuntimeClosedError();
-    this.started = true;
   }
 
   close(): Promise<void> {
@@ -155,7 +185,7 @@ export class AgentRuntime {
   private async finishClose(): Promise<void> {
     const pending = [...this.active.values()].flatMap((runs) => [...runs]);
     const operations = [...this.sessionOperations.values()].flatMap((items) => [...items]);
-    const closings = [...this.closingSessions.values()];
+    const closings = [...this.closingSessions.values()].map((entry) => entry.promise);
     for (const runs of this.active.values()) {
       for (const run of runs) run.controller.abort(new DOMException("Runtime closed", "AbortError"));
     }
@@ -167,6 +197,7 @@ export class AgentRuntime {
   }
 
   async capabilities(): Promise<RuntimeCapabilities> {
+    this.assertAvailable();
     return {
       contentTypes: ["text"],
       streaming: this.dependencies.loop.supportsStreaming,
@@ -183,7 +214,7 @@ export class AgentRuntime {
     const request = snapshotCreateSessionInput(input);
     const sessionId = request.sessionId ?? randomUUID();
     assertValidSessionId(sessionId);
-    const operation = this.beginSessionOperation(sessionId);
+    const operation = this.beginSessionOperation(sessionId, request.binding);
     try {
       await this.validateSelection(request.tools, request.skills);
       const metadata = sessionMetadata(request);
@@ -194,12 +225,17 @@ export class AgentRuntime {
     }
   }
 
-  async resumeSession(sessionId: string): Promise<SessionInfo> {
+  async resumeSession(
+    sessionId: string,
+    options: SessionAccessOptions = {},
+  ): Promise<SessionInfo> {
     this.assertAvailable();
     assertValidSessionId(sessionId);
-    const operation = this.beginSessionOperation(sessionId);
+    const expectedBinding = snapshotSessionBinding(options.expectedBinding);
+    const operation = this.beginSessionOperation(sessionId, expectedBinding);
     try {
       const session = await this.requireSession(sessionId);
+      assertExpectedBinding(session, expectedBinding);
       return this.toSessionInfo(session, false);
     } finally {
       this.endSessionOperation(sessionId, operation);
@@ -218,11 +254,20 @@ export class AgentRuntime {
     }
   }
 
-  async closeSession(sessionId: string): Promise<boolean> {
+  async closeSession(
+    sessionId: string,
+    options: SessionAccessOptions = {},
+  ): Promise<boolean> {
     this.assertAvailable();
     assertValidSessionId(sessionId);
+    const expectedBinding = snapshotSessionBinding(options.expectedBinding);
     const existing = this.closingSessions.get(sessionId);
-    if (existing) return existing;
+    if (existing) {
+      if (!sameBinding(existing.expectedBinding, expectedBinding)) {
+        throw new SessionBindingMismatchError(sessionId);
+      }
+      return existing.promise;
+    }
 
     let resolveClose!: (deleted: boolean) => void;
     let rejectClose!: (error: unknown) => void;
@@ -232,14 +277,15 @@ export class AgentRuntime {
     });
     // Publish the gate before aborting. Abort listeners run synchronously and may
     // otherwise admit a re-entrant prompt while the session is being closed.
-    this.closingSessions.set(sessionId, closing);
-    void this.finishCloseSession(sessionId).then((deleted) => {
-      if (this.closingSessions.get(sessionId) === closing) {
+    const entry: ClosingSession = { expectedBinding, promise: closing };
+    this.closingSessions.set(sessionId, entry);
+    void this.finishCloseSession(sessionId, expectedBinding).then((deleted) => {
+      if (this.closingSessions.get(sessionId) === entry) {
         this.closingSessions.delete(sessionId);
       }
       resolveClose(deleted);
     }, (error) => {
-      if (this.closingSessions.get(sessionId) === closing) {
+      if (this.closingSessions.get(sessionId) === entry) {
         this.closingSessions.delete(sessionId);
       }
       rejectClose(error);
@@ -251,13 +297,15 @@ export class AgentRuntime {
     this.assertAvailable();
     const request = snapshotPromptInput(input);
     assertValidSessionId(request.sessionId);
-    this.assertSessionNotClosing(request.sessionId);
+    this.assertSessionNotClosing(request.sessionId, request.expectedBinding);
 
     const controller = new AbortController();
     let resolveSettled!: () => void;
     const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
     const active: ActiveRun = {
       controller,
+      expectedBinding: request.expectedBinding,
+      bindingValidated: false,
       status: "queued",
       terminal: false,
       settled,
@@ -274,37 +322,54 @@ export class AgentRuntime {
     this.active.set(request.sessionId, runs);
 
     try {
-      // Runtime session resolution happens before AgentLoop's FIFO admission,
-      // so it needs its own cancellation barrier before touching the store.
-      throwIfAborted(controller.signal);
-      const session = await this.resolvePromptSession(request, controller.signal);
-      const sessionTools = readStringList(session.metadata[SESSION_TOOLS]);
-      const sessionSkills = readStringList(session.metadata[SESSION_SKILLS]);
-      const tools = selectWithinSession("tool", request.tools, sessionTools);
-      const skills = selectWithinSession("skill", request.skills, sessionSkills);
-      await this.validateSelection(tools, skills);
-
-      const result = await this.dependencies.loop.runTurnDetailed({
-        sessionId: request.sessionId,
-        userInput: joinText(request.content),
-        promptInjections: request.promptInjections,
-        skills,
-        tools,
-        signal: controller.signal,
-        onEvent: (event) => {
-          if (event.type === "run_started") {
-            active.runId = event.runId;
-            active.status = "running";
-          } else if (event.type === "run_completed"
-            || event.type === "run_failed"
-            || event.type === "run_cancelled") {
-            // Close external control admission before terminal observers run.
-            active.terminal = true;
+      // Reserve the canonical per-Session FIFO slot before any asynchronous
+      // Store or Skill work, so a slower first request cannot be overtaken by
+      // a later request or lose the createIfMissing capability-scope race.
+      const result = await this.dependencies.loop.runTurnDetailedDeferred(
+        request.sessionId,
+        async () => {
+          throwIfAborted(controller.signal);
+          const resolved = await this.resolvePromptSession(request, controller.signal);
+          const session = resolved.session;
+          assertExpectedBinding(session, request.expectedBinding);
+          active.bindingValidated = true;
+          const sessionTools = readCapabilityScope(session, SESSION_TOOLS, "tool");
+          const sessionSkills = readCapabilityScope(session, SESSION_SKILLS, "skill");
+          const tools = selectWithinSession("tool", request.tools, sessionTools);
+          const skills = selectWithinSession("skill", request.skills, sessionSkills);
+          let preparedSkills = resolved.preparedSkills;
+          if (preparedSkills && sameSelection(preparedSkills.names, skills)) {
+            this.validateSelectionNames(tools, skills);
+          } else {
+            preparedSkills = await this.validateSelection(tools, skills, controller.signal);
           }
-          notifyObserver(this.dependencies.onEvent, event);
-          notifyObserver(request.onEvent, event);
+
+          return {
+            input: {
+              sessionId: request.sessionId,
+              userInput: joinText(request.content),
+              promptInjections: request.promptInjections,
+              skills,
+              tools,
+              signal: controller.signal,
+              onEvent: (event: AgentLoopEvent) => {
+                if (event.type === "run_started") {
+                  active.runId = event.runId;
+                  active.status = "running";
+                } else if (event.type === "run_completed"
+                  || event.type === "run_failed"
+                  || event.type === "run_cancelled") {
+                  // Close external control admission before terminal observers run.
+                  active.terminal = true;
+                }
+                notifyObserver(this.dependencies.onEvent, event);
+                notifyObserver(request.onEvent, event);
+              },
+            },
+            skills: preparedSkills,
+          };
         },
-      });
+      );
       return {
         sessionId: result.sessionId,
         runId: result.runId,
@@ -319,23 +384,43 @@ export class AgentRuntime {
     }
   }
 
-  cancel(sessionId: string, reason = "Cancelled by client"): boolean {
+  cancel(
+    sessionId: string,
+    reason = "Cancelled by client",
+    options: SessionAccessOptions = {},
+  ): boolean {
+    const expectedBinding = snapshotSessionBinding(options.expectedBinding);
     const runs = this.active.get(sessionId);
     const cancellable = [...(runs ?? [])].filter(
-      (run) => !run.terminal && !run.controller.signal.aborted,
+      (run) => !run.terminal
+        && !run.controller.signal.aborted
+        && sameBinding(run.expectedBinding, expectedBinding),
     );
     if (cancellable.length === 0) return false;
     for (const run of cancellable) {
       run.controller.abort(new DOMException(reason, "AbortError"));
     }
-    this.dependencies.loop.clearSteering(sessionId);
+    // A foreign request can exist briefly while its Store read is pending.
+    // Cancelling that unvalidated request must not clear steering owned by a
+    // different, already-authorized Turn on the same Session ID.
+    if (cancellable.some((run) => run.bindingValidated)) {
+      this.dependencies.loop.clearSteering(sessionId);
+    }
     return true;
   }
 
-  steer(sessionId: string, message: string): boolean {
+  steer(
+    sessionId: string,
+    message: string,
+    options: SessionAccessOptions = {},
+  ): boolean {
+    const expectedBinding = snapshotSessionBinding(options.expectedBinding);
     const runs = this.active.get(sessionId);
     if (![...(runs ?? [])].some(
-      (run) => !run.terminal && !run.controller.signal.aborted,
+      (run) => !run.terminal
+        && !run.controller.signal.aborted
+        && run.bindingValidated
+        && sameBinding(run.expectedBinding, expectedBinding),
     )) return false;
     return this.dependencies.loop.steer(sessionId, message);
   }
@@ -348,13 +433,19 @@ export class AgentRuntime {
     }));
   }
 
-  async recoverSession(sessionId: string): Promise<RecoveryResult> {
+  async recoverSession(
+    sessionId: string,
+    options: SessionAccessOptions = {},
+  ): Promise<RecoveryResult> {
     this.assertAvailable();
     assertValidSessionId(sessionId);
-    const operation = this.beginSessionOperation(sessionId);
+    const expectedBinding = snapshotSessionBinding(options.expectedBinding);
+    const operation = this.beginSessionOperation(sessionId, expectedBinding, false);
     try {
-      await this.requireSession(sessionId);
-      return await this.dependencies.loop.recoverSession(sessionId);
+      return await this.dependencies.loop.recoverSessionDeferred(sessionId, async () => {
+        const session = await this.requireSession(sessionId);
+        assertExpectedBinding(session, expectedBinding);
+      });
     } finally {
       this.endSessionOperation(sessionId, operation);
     }
@@ -362,29 +453,61 @@ export class AgentRuntime {
 
   private assertAvailable(): void {
     if (this.closed) throw new RuntimeClosedError();
-    if (!this.started) this.started = true;
   }
 
-  private assertSessionNotClosing(sessionId: string): void {
-    if (this.closingSessions.has(sessionId)) throw new SessionClosingError(sessionId);
+  private assertSessionNotClosing(
+    sessionId: string,
+    expectedBinding?: SessionBinding,
+  ): void {
+    const closing = this.closingSessions.get(sessionId);
+    if (!closing) return;
+    if (!sameBinding(closing.expectedBinding, expectedBinding)) {
+      throw new SessionBindingMismatchError(sessionId);
+    }
+    throw new SessionClosingError(sessionId);
   }
 
-  private async finishCloseSession(sessionId: string): Promise<boolean> {
-    const pending = [...(this.active.get(sessionId) ?? [])];
+  private async finishCloseSession(
+    sessionId: string,
+    expectedBinding?: SessionBinding,
+  ): Promise<boolean> {
     const operations = [...(this.sessionOperations.get(sessionId) ?? [])];
-    this.cancel(sessionId, "Session closed");
-    await Promise.allSettled([
-      ...pending.map((run) => run.settled),
-      ...operations.map((operation) => operation.settled),
-    ]);
+    await Promise.allSettled(
+      operations.filter((operation) => operation.waitBeforeCancel)
+        .map((operation) => operation.settled),
+    );
+
+    // Authorization happens after the closing gate is visible and independent
+    // lifecycle reads/creates have settled. FIFO recovery is deliberately not
+    // awaited here: it may be queued behind the Turn that close must cancel.
+    // A mismatched close must never cancel an authorized active Turn.
+    let session = await this.dependencies.sessionStore.get(sessionId);
+    if (session) assertExpectedBinding(session, expectedBinding);
+
+    const pending = [...(this.active.get(sessionId) ?? [])];
+    this.cancel(sessionId, "Session closed", { expectedBinding });
+    await Promise.allSettled(pending.map((run) => run.settled));
+    await Promise.allSettled(operations.map((operation) => operation.settled));
+
+    // Re-read after active work settles so a binding changed by admitted work,
+    // or a Session created by an already-admitted createIfMissing prompt, cannot
+    // cross the ownership check immediately preceding deletion.
+    session = await this.dependencies.sessionStore.get(sessionId);
+    if (!session) return false;
+    assertExpectedBinding(session, expectedBinding);
     return this.dependencies.sessionStore.delete(sessionId);
   }
 
-  private beginSessionOperation(sessionId: string): PendingSessionOperation {
-    this.assertSessionNotClosing(sessionId);
+  private beginSessionOperation(
+    sessionId: string,
+    expectedBinding?: SessionBinding,
+    waitBeforeCancel = true,
+  ): PendingSessionOperation {
+    this.assertSessionNotClosing(sessionId, expectedBinding);
     let settle!: () => void;
     const settled = new Promise<void>((resolve) => { settle = resolve; });
     const operation: PendingSessionOperation = {
+      waitBeforeCancel,
       settled,
       resolveSettled: settle,
     };
@@ -401,26 +524,42 @@ export class AgentRuntime {
     operation.resolveSettled();
   }
 
-  private async resolvePromptSession(input: PromptInput, signal: AbortSignal): Promise<Session> {
+  private async resolvePromptSession(
+    input: PromptInput,
+    signal: AbortSignal,
+  ): Promise<ResolvedPromptSession> {
     throwIfAborted(signal);
     const existing = await this.dependencies.sessionStore.get(input.sessionId);
     // Do not turn a cancellation that raced the read into an empty Session.
     throwIfAborted(signal);
-    if (existing) return existing;
+    if (existing) return { session: existing };
     if (!input.createIfMissing) throw new SessionNotFoundError(input.sessionId);
 
-    await this.validateSelection(input.tools, input.skills);
+    const preparedSkills = await this.validateSelection(input.tools, input.skills, signal);
     throwIfAborted(signal);
     try {
-      return await this.dependencies.sessionStore.create(
-        input.sessionId,
-        sessionMetadata(input),
-      );
+      return {
+        session: await this.dependencies.sessionStore.create(
+          input.sessionId,
+          sessionMetadata({
+            metadata: input.metadata,
+            tools: input.tools,
+            skills: input.skills,
+            // For atomic createIfMissing admission, the expected owner becomes
+            // the protected owner of the newly-created Session.
+            binding: input.expectedBinding,
+          }),
+        ),
+        preparedSkills,
+      };
     } catch (error) {
       // Two adapters may admit the first turn concurrently. Whichever loses the
       // create race joins the same runtime-serialized session.
       if (!(error instanceof SessionAlreadyExistsError)) throw error;
-      return this.requireSession(input.sessionId, signal);
+      return {
+        session: await this.requireSession(input.sessionId, signal),
+        preparedSkills,
+      };
     }
   }
 
@@ -435,24 +574,49 @@ export class AgentRuntime {
   private async validateSelection(
     tools?: readonly string[],
     skills?: readonly string[],
-  ): Promise<void> {
+    signal?: AbortSignal,
+  ): Promise<PreparedSkillSelection> {
+    this.validateSelectionNames(tools, skills);
+    try {
+      return await this.dependencies.loop.prepareSkillSelection(skills, signal);
+    } catch (error) {
+      // AbortSignal reasons are not limited to DOM AbortError (for example,
+      // AbortSignal.timeout() uses TimeoutError and callers may supply their
+      // own Error). Preserve the canonical cancellation reason exactly.
+      throwIfAborted(signal);
+      if (isAbortError(error)) throw error;
+      throw new InvalidCapabilitySelectionError("skill", undefined, { cause: error });
+    }
+  }
+
+  private validateSelectionNames(
+    tools?: readonly string[],
+    skills?: readonly string[],
+  ): void {
     assertUniqueSelection("tool", tools);
     assertUniqueSelection("skill", skills);
-    for (const name of tools ?? []) this.dependencies.tools.get(name);
-    if (skills?.length) {
-      if (!this.dependencies.skillLoader) throw new Error("No SkillLoader configured");
-      await this.dependencies.skillLoader.load(skills);
+    for (const name of tools ?? []) {
+      try {
+        this.dependencies.tools.get(name);
+      } catch (error) {
+        throw new InvalidCapabilitySelectionError("tool", name, { cause: error });
+      }
     }
   }
 
   private toSessionInfo(session: Session, created: boolean): SessionInfo {
+    // Validate protected metadata before projecting any part of the record.
+    readSessionBinding(session);
+    const skills = cloneCapabilityScope(readCapabilityScope(session, SESSION_SKILLS, "skill"));
+    const tools = cloneCapabilityScope(readCapabilityScope(session, SESSION_TOOLS, "tool"));
     const metadata = structuredClone(session.metadata);
+    for (const key of RESERVED_SESSION_METADATA) delete metadata[key];
     return {
       sessionId: session.id,
       created,
       metadata,
-      skills: [...(readStringList(metadata[SESSION_SKILLS]) ?? [])],
-      tools: [...(readStringList(metadata[SESSION_TOOLS]) ?? [])],
+      skills,
+      tools,
       activeRunIds: this.activeRuns(session.id)
         .map((run) => run.runId)
         .filter((runId): runId is string => Boolean(runId)),
@@ -481,6 +645,51 @@ export class SessionClosingError extends Error {
   }
 }
 
+export class SessionBindingMismatchError extends Error {
+  constructor(sessionId: string) {
+    super(`Session binding does not match: ${sessionId}`);
+    this.name = "SessionBindingMismatchError";
+  }
+}
+
+export class InvalidSessionBindingError extends Error {
+  constructor(sessionId: string) {
+    super(`Session has invalid persisted binding metadata: ${sessionId}`);
+    this.name = "InvalidSessionBindingError";
+  }
+}
+
+export class InvalidSessionCapabilityScopeError extends Error {
+  constructor(sessionId: string, kind: "tool" | "skill") {
+    super(`Session has invalid persisted ${kind} capability scope: ${sessionId}`);
+    this.name = "InvalidSessionCapabilityScopeError";
+  }
+}
+
+export class InvalidCapabilitySelectionError extends Error {
+  constructor(
+    readonly kind: "tool" | "skill",
+    readonly capability?: string,
+    options?: ErrorOptions,
+    message?: string,
+  ) {
+    super(
+      message ?? (capability
+        ? `Unknown ${kind} capability: ${capability}`
+        : `Invalid ${kind} capability selection`),
+      options,
+    );
+    this.name = "InvalidCapabilitySelectionError";
+  }
+}
+
+export class SessionCapabilityDeniedError extends Error {
+  constructor(readonly kind: "tool" | "skill", readonly capability: string) {
+    super(`Requested ${kind} is not allowed by the session: ${capability}`);
+    this.name = "SessionCapabilityDeniedError";
+  }
+}
+
 export class RuntimeDependencyMismatchError extends Error {
   constructor(dependency: "sessionStore" | "tools" | "skills") {
     super(`AgentRuntime ${dependency} must be the same instance used by AgentLoop`);
@@ -499,33 +708,29 @@ function joinText(content: readonly RuntimeContentPart[]): string {
   return content.map((part) => part.text).join("");
 }
 
-function readStringList(value: unknown): readonly string[] | undefined {
-  return Array.isArray(value) && value.every((item) => typeof item === "string")
-    ? value
-    : undefined;
-}
-
 function selectWithinSession(
   kind: "tool" | "skill",
   requested?: readonly string[],
-  allowed?: readonly string[],
+  allowed: CapabilityScope = { mode: "all" },
 ): readonly string[] | undefined {
-  if (!requested) return allowed;
-  if (!allowed) return requested;
-  const allowedSet = new Set(allowed);
+  if (!requested) return allowed.mode === "all" ? undefined : allowed.names;
+  if (allowed.mode === "all") return requested;
+  const allowedSet = new Set(allowed.names);
   const denied = requested.find((name) => !allowedSet.has(name));
-  if (denied) throw new Error(`Requested ${kind} is not allowed by the session: ${denied}`);
+  if (denied) throw new SessionCapabilityDeniedError(kind, denied);
   return requested;
 }
 
-function sessionMetadata(input: Pick<CreateSessionInput, "metadata" | "skills" | "tools">): Record<string, unknown> {
+function sessionMetadata(
+  input: Pick<CreateSessionInput, "metadata" | "skills" | "tools" | "binding">,
+): Record<string, unknown> {
   const metadata = structuredClone(input.metadata ?? {});
-  delete metadata[SESSION_TOOLS];
-  delete metadata[SESSION_SKILLS];
+  for (const key of RESERVED_SESSION_METADATA) delete metadata[key];
   return {
     ...metadata,
     ...(input.tools ? { [SESSION_TOOLS]: [...input.tools] } : {}),
     ...(input.skills ? { [SESSION_SKILLS]: [...input.skills] } : {}),
+    ...(input.binding ? { [SESSION_BINDING]: { ...input.binding } } : {}),
   };
 }
 
@@ -535,6 +740,7 @@ function snapshotCreateSessionInput(input: CreateSessionInput): CreateSessionInp
     tools: input.tools ? [...input.tools] : undefined,
     skills: input.skills ? [...input.skills] : undefined,
     metadata: structuredClone(input.metadata),
+    binding: snapshotSessionBinding(input.binding),
   };
 }
 
@@ -547,9 +753,72 @@ function snapshotPromptInput(input: PromptInput): PromptInput {
     skills: input.skills ? [...input.skills] : undefined,
     promptInjections: input.promptInjections ? [...input.promptInjections] : undefined,
     metadata: structuredClone(input.metadata),
+    expectedBinding: snapshotSessionBinding(input.expectedBinding),
     signal: input.signal,
     onEvent: input.onEvent,
   };
+}
+
+function snapshotSessionBinding(binding: SessionBinding | undefined): SessionBinding | undefined {
+  if (!binding) return undefined;
+  if (typeof binding.kind !== "string" || binding.kind.length === 0
+    || typeof binding.value !== "string" || binding.value.length === 0) {
+    throw new TypeError("Session binding kind and value must be non-empty strings");
+  }
+  return { kind: binding.kind, value: binding.value };
+}
+
+function readSessionBinding(session: Session): SessionBinding | undefined {
+  if (!Object.hasOwn(session.metadata, SESSION_BINDING)) return undefined;
+  const value = session.metadata[SESSION_BINDING];
+  if (!isRecord(value)
+    || Object.keys(value).some((key) => key !== "kind" && key !== "value")
+    || typeof value.kind !== "string" || value.kind.length === 0
+    || typeof value.value !== "string" || value.value.length === 0) {
+    throw new InvalidSessionBindingError(session.id);
+  }
+  return { kind: value.kind, value: value.value };
+}
+
+function assertExpectedBinding(session: Session, expected: SessionBinding | undefined): void {
+  const actual = readSessionBinding(session);
+  if (!sameBinding(actual, expected)) {
+    throw new SessionBindingMismatchError(session.id);
+  }
+}
+
+function sameBinding(
+  left: SessionBinding | undefined,
+  right: SessionBinding | undefined,
+): boolean {
+  return left === undefined
+    ? right === undefined
+    : right !== undefined && left.kind === right.kind && left.value === right.value;
+}
+
+function readCapabilityScope(
+  session: Session,
+  key: typeof SESSION_TOOLS | typeof SESSION_SKILLS,
+  kind: "tool" | "skill",
+): CapabilityScope {
+  if (!Object.hasOwn(session.metadata, key)) return { mode: "all" };
+  const value = session.metadata[key];
+  if (!Array.isArray(value)
+    || !value.every((item) => typeof item === "string")
+    || new Set(value).size !== value.length) {
+    throw new InvalidSessionCapabilityScopeError(session.id, kind);
+  }
+  return { mode: "selected", names: value };
+}
+
+function cloneCapabilityScope(scope: CapabilityScope): CapabilityScope {
+  return scope.mode === "all"
+    ? { mode: "all" }
+    : { mode: "selected", names: [...scope.names] };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function assertUniqueSelection(
@@ -558,9 +827,22 @@ function assertUniqueSelection(
 ): void {
   const seen = new Set<string>();
   for (const name of names ?? []) {
-    if (seen.has(name)) throw new Error(`Duplicate ${kind} capability: ${name}`);
+    if (seen.has(name)) {
+      throw new InvalidCapabilitySelectionError(kind, name, {
+        cause: new Error(`Duplicate ${kind} capability: ${name}`),
+      }, `Duplicate ${kind} capability: ${name}`);
+    }
     seen.add(name);
   }
+}
+
+function sameSelection(
+  left: readonly string[],
+  right: readonly string[] | undefined,
+): boolean {
+  const normalized = right ?? [];
+  return left.length === normalized.length
+    && left.every((name, index) => name === normalized[index]);
 }
 
 function notifyObserver(
@@ -573,4 +855,8 @@ function notifyObserver(
   } catch {
     // Observer delivery is best-effort and cannot affect canonical run state.
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }

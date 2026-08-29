@@ -15,18 +15,21 @@ import {
   type Stream,
 } from "@agentclientprotocol/sdk";
 import {
-  AcpPermissionBridge,
-  AcpUpdateProjector,
   AgentLoop,
   AgentRuntime,
-  createAcpAgent,
   InMemorySessionStore,
   ToolRegistry,
   type ApprovalHandler,
-  type AcpAgentOptions,
   type ModelClient,
+  type SkillCatalog,
   type Tool,
 } from "../src/index.js";
+import {
+  AcpPermissionBridge,
+  AcpUpdateProjector,
+  createAcpAgent,
+  type AcpAgentOptions,
+} from "../src/acp/index.js";
 
 function createRuntime(
   model: ModelClient,
@@ -139,6 +142,35 @@ test("ACP v1 negotiates honest capabilities and maps session lifecycle", async (
         mcpServers: [],
       }),
       (error: unknown) => error instanceof RequestError && error.code === -32002,
+    );
+  });
+});
+
+test("ACP initialize redacts capability-discovery failures", async () => {
+  const secret = "INIT_SECRET_SENTINEL";
+  const skills: SkillCatalog = {
+    async list() {
+      throw new Error(secret);
+    },
+    async load() {
+      return [];
+    },
+  };
+  const loop = new AgentLoop({
+    model: { async complete() { return { content: "unused" }; } },
+    sessionStore: new InMemorySessionStore(),
+    tools: new ToolRegistry(),
+    skillLoader: skills,
+    requestApproval: async () => false,
+  });
+
+  await client().connectWith(createTestAcpAgent(new AgentRuntime({ loop })), async (context) => {
+    await assert.rejects(
+      initialize(context),
+      (error: unknown) => error instanceof RequestError
+        && error.code === -32603
+        && error.data === undefined
+        && !error.message.includes(secret),
     );
   });
 });
@@ -516,7 +548,8 @@ test("ACP rejects unsupported content and ACP-managed MCP servers precisely", as
       }),
       (error: unknown) => error instanceof RequestError
         && error.code === -32602
-        && /configured workspace root/.test(error.message),
+        && /configured workspace root/.test(error.message)
+        && !JSON.stringify(error.data).includes(process.cwd()),
     );
     await assert.rejects(
       context.request(methods.agent.session.prompt, {
@@ -546,7 +579,7 @@ test("ACP accepts a symlink alias for the configured canonical workspace", async
       cwd: alias,
       mcpServers: [],
     });
-    assert.equal((await runtime.getSession(sessionId))?.metadata["acp.cwd"], await realpath(workspace));
+    assert.equal((await runtime.getSession(sessionId))?.metadata["acp.cwd"], undefined);
     assert.deepEqual(await context.request(methods.agent.session.resume, {
       sessionId,
       cwd: alias,
@@ -555,12 +588,12 @@ test("ACP accepts a symlink alias for the configured canonical workspace", async
   });
 });
 
-test("ACP cannot resume, prompt, or delete a foreign unbound Session", async () => {
+test("ACP cannot be tricked into adopting a foreign Session through generic metadata", async () => {
   const { runtime } = createRuntime({ async complete() { return { content: "unused" }; } });
-  const sensitiveForeignRoot = "/private/tenant-secret/workspace";
+  const forgedWorkspace = await realpath(process.cwd());
   await runtime.createSession({
     sessionId: "foreign-session",
-    metadata: { "acp.cwd": sensitiveForeignRoot },
+    metadata: { "acp.cwd": forgedWorkspace },
   });
 
   await client().connectWith(createTestAcpAgent(runtime), async (context) => {
@@ -573,7 +606,7 @@ test("ACP cannot resume, prompt, or delete a foreign unbound Session", async () 
       }),
       (error: unknown) => error instanceof RequestError
         && error.code === -32002
-        && !JSON.stringify(error).includes(sensitiveForeignRoot),
+        && !JSON.stringify(error).includes(forgedWorkspace),
     );
     await assert.rejects(
       context.request(methods.agent.session.prompt, {
@@ -582,9 +615,9 @@ test("ACP cannot resume, prompt, or delete a foreign unbound Session", async () 
       }),
       (error: unknown) => error instanceof RequestError && error.code === -32002,
     );
-    await assert.rejects(
-      context.request(methods.agent.session.delete, { sessionId: "foreign-session" }),
-      (error: unknown) => error instanceof RequestError && error.code === -32002,
+    assert.deepEqual(
+      await context.request(methods.agent.session.delete, { sessionId: "foreign-session" }),
+      {},
     );
   });
   assert.ok(await runtime.getSession("foreign-session"));
@@ -647,7 +680,8 @@ test("ACP bounds pending session updates and cancels on backpressure", async () 
       }),
       (error: unknown) => error instanceof RequestError
         && error.code === -32603
-        && /queue exceeded/.test(JSON.stringify(error.data)),
+        && error.data === undefined
+        && /agent runtime request failed/.test(error.message),
     );
     assert.equal((await sessionStore.get(sessionId))?.runState?.status, "cancelled");
   });
@@ -761,6 +795,37 @@ test("ACP projector cancellation releases a hung transport delivery", async () =
   await projector.drain();
   assert.equal(projector.failure, undefined);
   assert.equal(deliveries, 1);
+});
+
+test("ACP projector redacts Tool failure details", async () => {
+  const delivered: unknown[] = [];
+  const controller = new AbortController();
+  const projector = new AcpUpdateProjector({
+    sessionId: "redacted-tool-failure",
+    client: {
+      notify(_method: unknown, params: unknown) {
+        delivered.push(params);
+        return Promise.resolve();
+      },
+    } as unknown as AgentContext,
+    maxPendingUpdates: 2,
+    signal: controller.signal,
+    deliveryTimeoutMs: 1_000,
+    onFailure: (error) => controller.abort(error),
+  });
+
+  projector.observe({
+    type: "tool_call_failed",
+    sessionId: "redacted-tool-failure",
+    runId: "run-redacted",
+    call: { id: "call-redacted", name: "private_tool", arguments: {} },
+    error: "postgresql://admin:secret@internal.invalid/database",
+  });
+  await projector.drain();
+
+  const wire = JSON.stringify(delivered);
+  assert.doesNotMatch(wire, /admin|secret|internal\.invalid/);
+  assert.match(wire, /Tool call failed/);
 });
 
 test("ACP permission bridge defaults to deny outside an ACP prompt", async () => {
