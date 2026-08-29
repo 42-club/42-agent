@@ -53,8 +53,19 @@ export interface AcpAgentOptions {
    * trusted Session-ID allowlist, never from persisted `acp.cwd` alone.
    */
   authorizeLegacySessionMigration?: (
-    request: Readonly<{ sessionId: string; workspaceRoot: string }>,
+    request: Readonly<{
+      sessionId: string;
+      workspaceRoot: string;
+      signal: AbortSignal;
+    }>,
   ) => boolean | Promise<boolean>;
+}
+
+interface PendingResume {
+  controller: AbortController;
+  settled: Promise<void>;
+  resolveSettled: () => void;
+  detachRequestSignal: () => void;
 }
 
 /** Build a stable ACP v1 agent over the protocol-neutral AgentRuntime. */
@@ -80,6 +91,8 @@ export function createAcpAgent(
   const authorizeLegacySessionMigration = options.authorizeLegacySessionMigration;
 
   const activePrompts = new Map<string, Set<AbortController>>();
+  const pendingResumes = new Map<string, Set<PendingResume>>();
+  const deletingSessions = new Map<string, number>();
   let activeConnection: AgentConnection | undefined;
 
   return agent({ name: implementation.name })
@@ -87,7 +100,8 @@ export function createAcpAgent(
       // AgentRuntime is a single-client process boundary. Keeping one live ACP
       // connection also lets session authorization and cancel ownership remain
       // unambiguous without leaking SDK connection internals into the Runtime.
-      if (activeConnection || activePrompts.size > 0) {
+      if (activeConnection || activePrompts.size > 0
+        || pendingResumes.size > 0 || deletingSessions.size > 0) {
         connection.close(new Error("This ACP agent already has an active client connection"));
         return;
       }
@@ -96,6 +110,7 @@ export function createAcpAgent(
         if (activeConnection === connection) {
           activeConnection = undefined;
         }
+        abortPendingResumes(pendingResumes, undefined, "ACP connection closed");
       }, { once: true });
     })
     .onRequest(methods.agent.initialize, async () => {
@@ -129,25 +144,46 @@ export function createAcpAgent(
         throw toRequestError(error);
       }
     })
-    .onRequest(methods.agent.session.resume, async ({ params }) => {
-      await validateWorkspaceRequest(params, workspaceRoot);
+    .onRequest(methods.agent.session.resume, async (context) => {
+      let pending: PendingResume;
       try {
+        pending = beginPendingResume(
+          pendingResumes,
+          deletingSessions,
+          context.params.sessionId,
+          context.signal,
+        );
+      } catch (error) {
+        throw toRequestError(error, context.params.sessionId);
+      }
+      try {
+        await validateWorkspaceRequest(context.params, workspaceRoot);
         await resumeAcpSession(
           runtime,
-          params.sessionId,
+          context.params.sessionId,
           workspaceRoot,
           authorizeLegacySessionMigration,
+          pending.controller.signal,
         );
         return {};
       } catch (error) {
-        throw toRequestError(error, params.sessionId);
+        throw toRequestError(error, context.params.sessionId);
+      } finally {
+        endPendingResume(pendingResumes, context.params.sessionId, pending);
       }
     })
     .onRequest(methods.agent.session.delete, async ({ params }) => {
+      const finishDeleting = beginDeletingSession(deletingSessions, params.sessionId);
       try {
+        abortPendingResumes(pendingResumes, params.sessionId, "Session deleted by ACP client");
+        await waitForPendingResumes(pendingResumes, params.sessionId);
         await runtime.closeSession(params.sessionId, {
           expectedBinding: acpSessionBinding(workspaceRoot),
         });
+        // Runtime close owns Session authorization and Turn cancellation. Only
+        // after that check succeeds may delete terminate adapter-local work
+        // that can outlive the Turn itself, such as a blocked update projector.
+        abortPrompts(activePrompts, params.sessionId, "Session deleted by ACP client");
         return {};
       } catch (error) {
         if (error instanceof SessionBindingMismatchError) {
@@ -156,9 +192,17 @@ export function createAcpAgent(
           return {};
         }
         throw toRequestError(error, params.sessionId);
+      } finally {
+        finishDeleting();
       }
     })
     .onRequest(methods.agent.session.prompt, async (context) => {
+      if (deletingSessions.has(context.params.sessionId)) {
+        throw toRequestError(
+          new SessionClosingError(context.params.sessionId),
+          context.params.sessionId,
+        );
+      }
       const controller = new AbortController();
       const detachRequestSignal = forwardAbort(context.signal, controller);
       const controllers = activePrompts.get(context.params.sessionId) ?? new Set();
@@ -241,10 +285,13 @@ async function resumeAcpSession(
   sessionId: string,
   workspaceRoot: string,
   authorizeLegacySessionMigration: AcpAgentOptions["authorizeLegacySessionMigration"],
+  signal: AbortSignal,
 ): Promise<void> {
   const binding = acpSessionBinding(workspaceRoot);
+  throwIfSignalAborted(signal);
   try {
     await runtime.resumeSession(sessionId, { expectedBinding: binding });
+    throwIfSignalAborted(signal);
     return;
   } catch (error) {
     if (!(error instanceof LegacySessionBindingMigrationRequiredError)
@@ -253,11 +300,19 @@ async function resumeAcpSession(
     }
     let approved: boolean;
     try {
-      approved = await authorizeLegacySessionMigration(Object.freeze({
-        sessionId,
-        workspaceRoot,
-      }));
+      approved = await raceWithAbort(
+        Promise.resolve().then(() => {
+          throwIfSignalAborted(signal);
+          return authorizeLegacySessionMigration(Object.freeze({
+            sessionId,
+            workspaceRoot,
+            signal,
+          }));
+        }),
+        signal,
+      );
     } catch (cause) {
+      if (signal.aborted) throw signal.reason ?? new DOMException("ACP resume aborted", "AbortError");
       // A host callback is not a protocol extension point. In particular, a
       // RequestError thrown by it must not pass through to an untrusted client.
       throw new Error("Legacy Session migration authorization failed", { cause });
@@ -265,10 +320,12 @@ async function resumeAcpSession(
     if (approved !== true) throw error;
   }
 
+  throwIfSignalAborted(signal);
   await runtime.migrateLegacySessionBinding(sessionId, {
     legacyMetadata: { key: LEGACY_ACP_CWD_METADATA, value: workspaceRoot },
     binding,
   });
+  throwIfSignalAborted(signal);
   await runtime.resumeSession(sessionId, { expectedBinding: binding });
 }
 
@@ -364,6 +421,99 @@ function abortPrompts(
   }
 }
 
+function beginPendingResume(
+  pendingResumes: Map<string, Set<PendingResume>>,
+  deletingSessions: ReadonlyMap<string, number>,
+  sessionId: string,
+  requestSignal: AbortSignal,
+): PendingResume {
+  if (deletingSessions.has(sessionId)) throw new SessionClosingError(sessionId);
+
+  const controller = new AbortController();
+  let resolveSettled!: () => void;
+  const pending: PendingResume = {
+    controller,
+    settled: new Promise<void>((resolve) => { resolveSettled = resolve; }),
+    resolveSettled: () => resolveSettled(),
+    detachRequestSignal: forwardAbort(requestSignal, controller),
+  };
+  const scopes = pendingResumes.get(sessionId) ?? new Set<PendingResume>();
+  scopes.add(pending);
+  pendingResumes.set(sessionId, scopes);
+  return pending;
+}
+
+function endPendingResume(
+  pendingResumes: Map<string, Set<PendingResume>>,
+  sessionId: string,
+  pending: PendingResume,
+): void {
+  pending.detachRequestSignal();
+  const scopes = pendingResumes.get(sessionId);
+  scopes?.delete(pending);
+  if (scopes?.size === 0) pendingResumes.delete(sessionId);
+  pending.resolveSettled();
+}
+
+function abortPendingResumes(
+  pendingResumes: ReadonlyMap<string, ReadonlySet<PendingResume>>,
+  sessionId: string | undefined,
+  reason: string,
+): void {
+  const scopes = sessionId === undefined
+    ? [...pendingResumes.values()].flatMap((items) => [...items])
+    : [...(pendingResumes.get(sessionId) ?? [])];
+  for (const pending of scopes) {
+    pending.controller.abort(new DOMException(reason, "AbortError"));
+  }
+}
+
+async function waitForPendingResumes(
+  pendingResumes: ReadonlyMap<string, ReadonlySet<PendingResume>>,
+  sessionId: string,
+): Promise<void> {
+  const scopes = [...(pendingResumes.get(sessionId) ?? [])];
+  await Promise.allSettled(scopes.map((pending) => pending.settled));
+}
+
+function beginDeletingSession(
+  deletingSessions: Map<string, number>,
+  sessionId: string,
+): () => void {
+  deletingSessions.set(sessionId, (deletingSessions.get(sessionId) ?? 0) + 1);
+  return () => {
+    const remaining = (deletingSessions.get(sessionId) ?? 1) - 1;
+    if (remaining === 0) deletingSessions.delete(sessionId);
+    else deletingSessions.set(sessionId, remaining);
+  };
+}
+
+function throwIfSignalAborted(signal: AbortSignal): void {
+  if (signal.aborted) {
+    throw signal.reason ?? new DOMException("ACP request aborted", "AbortError");
+  }
+}
+
+function raceWithAbort<Result>(operation: Promise<Result>, signal: AbortSignal): Promise<Result> {
+  if (signal.aborted) {
+    void operation.catch(() => undefined);
+    return Promise.reject(signal.reason ?? new DOMException("ACP request aborted", "AbortError"));
+  }
+  return new Promise<Result>((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(signal.reason ?? new DOMException("ACP request aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void operation.then((result) => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(result);
+    }, (error: unknown) => {
+      signal.removeEventListener("abort", onAbort);
+      reject(error);
+    });
+  });
+}
+
 function forwardAbort(source: AbortSignal, target: AbortController): () => void {
   const abort = (): void => target.abort(source.reason);
   if (source.aborted) abort();
@@ -373,6 +523,7 @@ function forwardAbort(source: AbortSignal, target: AbortController): () => void 
 
 function toRequestError(error: unknown, sessionId?: string): RequestError {
   if (error instanceof RequestError) return error;
+  if (isAbortError(error)) return RequestError.requestCancelled();
   if (error instanceof SessionNotFoundError) {
     return RequestError.resourceNotFound(`session:${sessionId ?? "unknown"}`);
   }

@@ -33,6 +33,8 @@ class DurableOutcomeUnknownStore implements SessionStore {
   versionAtUnknownSave?: number;
   private readonly sessions = new Map<string, Session>();
 
+  constructor(private readonly failAt = 2) {}
+
   async get(sessionId: string): Promise<Session | undefined> {
     const session = this.sessions.get(sessionId);
     return session ? structuredClone(session) : undefined;
@@ -63,7 +65,7 @@ class DurableOutcomeUnknownStore implements SessionStore {
     const durable = structuredClone(session);
     durable.version = expected + 1;
     this.sessions.set(session.id, durable);
-    if (this.saveCalls === 2) {
+    if (this.saveCalls === this.failAt) {
       this.versionAtUnknownSave = session.version;
       throw this.error;
     }
@@ -118,6 +120,83 @@ test("does not terminal-save a Session after a checkpoint outcome becomes unknow
   assert.equal(durable?.version, 2);
   assert.equal(durable?.runState?.status, "running");
   assert.equal(durable?.runState?.phase, "model");
+});
+
+test("tool checkpoints fail-stop after a save outcome becomes unknown", async () => {
+  const store = new DurableOutcomeUnknownStore(5);
+  let modelCalls = 0;
+  let toolExecutions = 0;
+  const tools = new ToolRegistry();
+  tools.register({
+    name: "effect",
+    description: "Perform one externally visible effect",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    async execute() {
+      toolExecutions += 1;
+      return { ok: true };
+    },
+  });
+  const loop = new AgentLoop({
+    model: {
+      async complete() {
+        modelCalls += 1;
+        return modelCalls === 1
+          ? { toolCalls: [{ id: "effect-1", name: "effect", arguments: {} }] }
+          : { content: "must not continue" };
+      },
+    },
+    tools,
+    sessionStore: store,
+    requestApproval: async () => false,
+  });
+
+  await assert.rejects(
+    loop.runTurn({ sessionId: "unknown-tool-checkpoint", userInput: "go" }),
+    (error) => error === store.error,
+  );
+
+  assert.equal(store.saveCalls, 5);
+  assert.equal(store.versionAtUnknownSave, 4);
+  assert.equal(modelCalls, 1);
+  assert.equal(toolExecutions, 1);
+  const durable = await store.get("unknown-tool-checkpoint");
+  assert.equal(durable?.version, 5);
+  assert.equal(durable?.runState?.status, "running");
+  assert.equal(durable?.runState?.phase, "tools");
+  assert.equal(durable?.runState?.toolCalls[0]?.status, "completed");
+  assert.deepEqual(durable?.messages.map(({ role }) => role), ["user", "assistant"]);
+});
+
+test("Run policies ignore unrelated non-cloneable Session metadata", async () => {
+  const store = new InMemorySessionStore();
+  const callback = () => "host-only";
+  await store.create("non-cloneable-policy-metadata", { callback });
+  let modelCalls = 0;
+  const loop = new AgentLoop({
+    model: {
+      async complete() {
+        modelCalls += 1;
+        return { content: "done" };
+      },
+    },
+    tools: new ToolRegistry(),
+    sessionStore: store,
+    requestApproval: async () => false,
+  });
+
+  assert.deepEqual(await loop.recoverSession("non-cloneable-policy-metadata"), {
+    recovered: false,
+    interruptedToolCalls: 0,
+  });
+  assert.equal(await loop.runTurn({
+    sessionId: "non-cloneable-policy-metadata",
+    userInput: "go",
+  }), "done");
+
+  assert.equal(modelCalls, 1);
+  const session = await store.get("non-cloneable-policy-metadata");
+  assert.equal(session?.metadata.callback, callback);
+  assert.equal(session?.runState?.status, "completed");
 });
 
 test("performs a tool round trip", async () => {

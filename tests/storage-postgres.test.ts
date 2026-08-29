@@ -67,6 +67,21 @@ test("PostgreSQL Store preserves the SessionStore transaction contract", {
   const observer = new Pool({ connectionString: postgresUrl, max: 1 });
   try {
     await migratePostgresSchema({ profile: "postgres", connectionString: postgresUrl });
+    const ownershipColumn = await observer.query<{
+      data_type: string;
+      is_nullable: string;
+    }>(
+      `SELECT data_type, is_nullable
+       FROM information_schema.columns
+       WHERE table_schema = 'agent_runtime'
+         AND table_name = 'sessions'
+         AND column_name = 'ownership_json'`,
+    );
+    assert.deepEqual(ownershipColumn.rows, [{ data_type: "jsonb", is_nullable: "YES" }]);
+    const ownershipMigration = await observer.query<{ name: string }>(
+      "SELECT name FROM agent_runtime.schema_migrations WHERE version = 2",
+    );
+    assert.equal(ownershipMigration.rows[0]?.name, "protected_session_ownership");
     const store = await openSessionStore({
       namespace,
       postgres: { connectionString: postgresUrl },
@@ -79,7 +94,12 @@ test("PostgreSQL Store preserves the SessionStore transaction contract", {
     session.messages.push({
       role: "user",
       content: "hello",
-      metadata: { z: 1, a: 2 },
+      metadata: Object.fromEntries([
+        ["e\u0301", "decomposed"],
+        ["é", "composed"],
+        ["z", 1],
+        ["a", 2],
+      ]),
       createdAt: "2026-01-01T08:00:00.000+08:00",
     });
     session.runState = {
@@ -106,6 +126,8 @@ test("PostgreSQL Store preserves the SessionStore transaction contract", {
     assert.deepEqual(restored?.messages.map((message) => message.content), ["hello", "world"]);
     assert.equal(restored?.messages[0]?.createdAt, "2026-01-01T08:00:00.000+08:00");
     assert.deepEqual(restored?.runState?.toolCalls[0]?.result, { ok: true });
+    assert.equal(restored?.messages[0]?.metadata?.["e\u0301"], "decomposed");
+    assert.equal(restored?.messages[0]?.metadata?.["é"], "composed");
     assert.equal(restored?.runState?.startedAt, "2026-01-01T08:00:00.000+08:00");
     const checkpoint = await observer.query<{ last_checkpoint_id: string | null }>(
       `SELECT last_checkpoint_id FROM agent_runtime.sessions
@@ -129,6 +151,19 @@ test("PostgreSQL Store preserves the SessionStore transaction contract", {
     const afterRollback = await store.get(sessionId);
     assert.equal(afterRollback?.version, beforeRollback.version);
     assert.equal(afterRollback?.messages.some((message) => message.content === "must roll back"), false);
+
+    const nulSession = await store.create(`nul-data-${randomUUID()}`);
+    nulSession.messages.push({ role: "user", content: "before\0after" });
+    await assert.rejects(store.save(nulSession), { name: "PostgresSessionDataError" });
+    assert.equal(nulSession.version, 0);
+    assert.deepEqual((await store.get(nulSession.id))?.messages, []);
+    await store.delete(nulSession.id);
+
+    const malformedUnicode = await store.create(`malformed-data-${randomUUID()}`);
+    malformedUnicode.messages.push({ role: "user", content: "before\ud800after" });
+    await assert.rejects(store.save(malformedUnicode), { name: "PostgresSessionDataError" });
+    assert.deepEqual((await store.get(malformedUnicode.id))?.messages, []);
+    await store.delete(malformedUnicode.id);
 
     const left = await store.get(sessionId);
     const right = await store.get(sessionId);
@@ -211,3 +246,65 @@ test("PostgreSQL startup rejects migration checksum drift and future versions", 
     await admin.end();
   }
 });
+
+test("PostgreSQL readiness rejects runtime roles missing any documented table privilege", {
+  skip: postgresUrl ? false : "set TEST_POSTGRES_URL to run PostgreSQL integration tests",
+}, async () => {
+  assert.ok(postgresUrl);
+  const admin = new Pool({ connectionString: postgresUrl, max: 1 });
+  const role = `agent_runtime_readiness_${randomUUID().replaceAll("-", "")}`;
+  const quotedRole = quoteIdentifier(role);
+  let currentUser = "";
+  let roleCreated = false;
+  let store: ManagedSessionStore | undefined;
+  try {
+    await migratePostgresSchema({ profile: "postgres", connectionString: postgresUrl });
+    const identity = await admin.query<{ current_user: string }>("SELECT current_user");
+    currentUser = identity.rows[0]!.current_user;
+    await admin.query(`CREATE ROLE ${quotedRole}`);
+    roleCreated = true;
+    await admin.query(`GRANT ${quotedRole} TO ${quoteIdentifier(currentUser)}`);
+    await admin.query(`GRANT USAGE ON SCHEMA agent_runtime TO ${quotedRole}`);
+    await admin.query(`GRANT SELECT ON agent_runtime.schema_migrations TO ${quotedRole}`);
+
+    const runtimeUrl = new URL(postgresUrl);
+    const existingOptions = runtimeUrl.searchParams.get("options");
+    runtimeUrl.searchParams.set(
+      "options",
+      [existingOptions, `-c role=${role}`].filter(Boolean).join(" "),
+    );
+    await assert.rejects(openSessionStore({
+      namespace: `privilege-${randomUUID()}`,
+      postgres: { connectionString: runtimeUrl.toString() },
+    }), {
+      name: "PostgresSchemaPermissionError",
+      message: /INSERT, UPDATE, DELETE on agent_runtime\.sessions/,
+    });
+
+    await admin.query(
+      `GRANT SELECT, INSERT, UPDATE, DELETE ON
+         agent_runtime.sessions, agent_runtime.messages,
+         agent_runtime.runs, agent_runtime.tool_calls TO ${quotedRole}`,
+    );
+    store = await openSessionStore({
+      namespace: `privilege-${randomUUID()}`,
+      postgres: { connectionString: runtimeUrl.toString() },
+    });
+    const session = await store.create("ready");
+    assert.equal(await store.delete(session.id), true);
+  } finally {
+    await store?.close();
+    if (roleCreated) {
+      await admin.query(`DROP OWNED BY ${quotedRole}`);
+      if (currentUser) {
+        await admin.query(`REVOKE ${quotedRole} FROM ${quoteIdentifier(currentUser)}`);
+      }
+      await admin.query(`DROP ROLE ${quotedRole}`);
+    }
+    await admin.end();
+  }
+});
+
+function quoteIdentifier(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}

@@ -75,11 +75,41 @@ export function estimateTokenUpperBound(text: string): number {
 
 /** Safety-biased fallback for clients without a provider token counter. */
 export function estimateModelRequestTokens(request: ModelRequest): number {
-  return estimateTokenUpperBound(JSON.stringify({
+  return estimateTokenUpperBound(stringifyTokenEstimate({
     systemPrompt: request.systemPrompt,
-    messages: request.messages,
+    messages: request.messages.map(toSemanticModelMessage),
     tools: request.tools,
   }));
+}
+
+function toSemanticModelMessage(message: Message): Record<string, unknown> {
+  const semantic: Record<string, unknown> = {
+    role: message.role,
+    content: message.content,
+  };
+  if (message.role === "tool") {
+    if (message.name !== undefined) semantic.name = message.name;
+    if (message.toolCallId !== undefined) semantic.toolCallId = message.toolCallId;
+  } else if (message.role === "assistant" && Array.isArray(message.metadata?.toolCalls)) {
+    // Tool calls are the only canonical Message metadata serialized by the
+    // packaged providers. Other metadata is runtime/application state and must
+    // not consume the model's input budget.
+    semantic.toolCalls = message.metadata.toolCalls;
+  }
+  return semantic;
+}
+
+function stringifyTokenEstimate(value: unknown): string {
+  const ancestors: object[] = [];
+  return JSON.stringify(value, function (this: unknown, _key, candidate: unknown) {
+    if (typeof candidate === "bigint") return `${candidate}n`;
+    if (candidate !== null && typeof candidate === "object") {
+      while (ancestors.length > 0 && ancestors.at(-1) !== this) ancestors.pop();
+      if (ancestors.includes(candidate)) return "[Circular]";
+      ancestors.push(candidate);
+    }
+    return candidate;
+  }) ?? "null";
 }
 
 export type ModelStreamEvent =

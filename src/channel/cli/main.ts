@@ -24,7 +24,7 @@ while (true) {
         if (!streamed) stdout.write(item.content);
         stdout.write("\n\n");
       } else if (item.type === "error") {
-        console.error(`错误：${item.message}`);
+        console.error(`错误 [${item.code}]：${item.message}`);
       }
     }
   } catch (error) {

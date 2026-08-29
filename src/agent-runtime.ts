@@ -6,7 +6,14 @@ import type {
 } from "./agent-loop.js";
 import type { AgentLoopEvent, AgentLoopEventHandler } from "./runtime/events.js";
 import { throwIfAborted } from "./runtime/retry.js";
-import { assertValidSessionId, SessionAlreadyExistsError, type Session, type SessionStore } from "./session.js";
+import {
+  assertValidSessionId,
+  SessionAlreadyExistsError,
+  snapshotSessionOwnership,
+  type Session,
+  type SessionOwnership,
+  type SessionStore,
+} from "./session.js";
 import type { SkillCatalog, SkillDescriptor, SkillLoader } from "./skills.js";
 import type { ToolDescriptor, ToolRegistry } from "./tools/base.js";
 
@@ -149,7 +156,7 @@ interface ResolvedPromptSession {
 const SESSION_SKILLS = "runtime.skills";
 const SESSION_TOOLS = "runtime.tools";
 const SESSION_BINDING = "runtime.binding";
-const SESSION_BINDING_VERSION = 1;
+const SESSION_OWNERSHIP_VERSION = 1;
 const LEGACY_ACP_CWD_METADATA = "acp.cwd";
 const LEGACY_SESSION_BINDING_METADATA = [LEGACY_ACP_CWD_METADATA] as const;
 const RESERVED_SESSION_METADATA = [
@@ -230,13 +237,23 @@ export class AgentRuntime {
   async createSession(input: CreateSessionInput = {}): Promise<SessionInfo> {
     this.assertAvailable();
     const request = snapshotCreateSessionInput(input);
+    this.assertSessionOwnershipSupported(request.binding);
     const sessionId = request.sessionId ?? randomUUID();
     assertValidSessionId(sessionId);
     const operation = this.beginSessionOperation(sessionId, request.binding);
     try {
       await this.validateSelection(request.tools, request.skills);
       const metadata = sessionMetadata(request);
-      const session = await this.dependencies.sessionStore.create(sessionId, metadata);
+      const session = await this.dependencies.sessionStore.create(
+        sessionId,
+        metadata,
+        request.binding ? { ownership: storedSessionOwnership(request.binding) } : undefined,
+      );
+      assertExpectedBinding(
+        session,
+        request.binding,
+        this.dependencies.sessionStore.supportsSessionOwnership === true,
+      );
       return this.toSessionInfo(session, true);
     } finally {
       this.endSessionOperation(sessionId, operation);
@@ -250,10 +267,15 @@ export class AgentRuntime {
     this.assertAvailable();
     assertValidSessionId(sessionId);
     const expectedBinding = snapshotSessionBinding(options.expectedBinding);
+    this.assertSessionOwnershipSupported(expectedBinding);
     const operation = this.beginSessionOperation(sessionId, expectedBinding);
     try {
       const session = await this.requireSession(sessionId);
-      assertExpectedBinding(session, expectedBinding);
+      assertExpectedBinding(
+        session,
+        expectedBinding,
+        this.dependencies.sessionStore.supportsSessionOwnership === true,
+      );
       return this.toSessionInfo(session, false);
     } finally {
       this.endSessionOperation(sessionId, operation);
@@ -272,12 +294,21 @@ export class AgentRuntime {
     this.assertAvailable();
     assertValidSessionId(sessionId);
     const request = snapshotLegacySessionBindingMigrationInput(input);
-    const operation = this.beginSessionOperation(sessionId, request.binding);
+    this.assertSessionOwnershipSupported(request.binding);
+    // The FIFO migration may be queued behind an active Turn. Close must abort
+    // that Turn before awaiting this operation, just as it does for recovery.
+    const operation = this.beginSessionOperation(sessionId, request.binding, false);
     try {
       return await this.dependencies.loop.runSessionOperationDeferred(sessionId, async () => {
         const session = await this.requireSession(sessionId);
         if (Object.hasOwn(session.metadata, SESSION_BINDING)) {
-          const existing = readVersionedSessionBinding(session);
+          throw new InvalidSessionBindingError(sessionId);
+        }
+        const existing = readStoredSessionOwnership(
+          session,
+          this.dependencies.sessionStore.supportsSessionOwnership === true,
+        );
+        if (existing) {
           // Concurrent trusted migrations may join after the first save. Do not
           // save again; in particular, never retry an outcome-unknown write.
           if (sameBinding(existing, request.binding)
@@ -291,12 +322,15 @@ export class AgentRuntime {
           throw new SessionBindingMismatchError(sessionId);
         }
 
-        const migrated: Session = { ...session, metadata: { ...session.metadata } };
+        const migrated: Session = {
+          ...session,
+          metadata: { ...session.metadata },
+          ownership: storedSessionOwnership(request.binding),
+        };
         delete migrated.metadata[request.legacyMetadata.key];
-        migrated.metadata[SESSION_BINDING] = storedSessionBinding(request.binding);
         // Exactly one versioned save. Outcome-unknown errors propagate so the
         // host reloads instead of guessing whether a retry is safe.
-        await this.dependencies.sessionStore.save(migrated);
+        await this.dependencies.sessionStore.save(migrated, { claimOwnership: true });
         return this.toSessionInfo(migrated, false);
       });
     } finally {
@@ -323,6 +357,7 @@ export class AgentRuntime {
     this.assertAvailable();
     assertValidSessionId(sessionId);
     const expectedBinding = snapshotSessionBinding(options.expectedBinding);
+    this.assertSessionOwnershipSupported(expectedBinding);
     const existing = this.closingSessions.get(sessionId);
     if (existing) {
       if (!sameBinding(existing.expectedBinding, expectedBinding)) {
@@ -358,6 +393,7 @@ export class AgentRuntime {
   async prompt(input: PromptInput): Promise<TurnResult> {
     this.assertAvailable();
     const request = snapshotPromptInput(input);
+    this.assertSessionOwnershipSupported(request.expectedBinding);
     assertValidSessionId(request.sessionId);
     this.assertSessionNotClosing(request.sessionId, request.expectedBinding);
 
@@ -393,7 +429,11 @@ export class AgentRuntime {
           throwIfAborted(controller.signal);
           const resolved = await this.resolvePromptSession(request, controller.signal);
           const session = resolved.session;
-          assertExpectedBinding(session, request.expectedBinding);
+          assertExpectedBinding(
+            session,
+            request.expectedBinding,
+            this.dependencies.sessionStore.supportsSessionOwnership === true,
+          );
           active.bindingValidated = true;
           const sessionTools = readCapabilityScope(session, SESSION_TOOLS, "tool");
           const sessionSkills = readCapabilityScope(session, SESSION_SKILLS, "skill");
@@ -452,6 +492,7 @@ export class AgentRuntime {
     options: SessionAccessOptions = {},
   ): boolean {
     const expectedBinding = snapshotSessionBinding(options.expectedBinding);
+    this.assertSessionOwnershipSupported(expectedBinding);
     const runs = this.active.get(sessionId);
     const cancellable = [...(runs ?? [])].filter(
       (run) => !run.terminal
@@ -477,6 +518,7 @@ export class AgentRuntime {
     options: SessionAccessOptions = {},
   ): boolean {
     const expectedBinding = snapshotSessionBinding(options.expectedBinding);
+    this.assertSessionOwnershipSupported(expectedBinding);
     const runs = this.active.get(sessionId);
     if (![...(runs ?? [])].some(
       (run) => !run.terminal
@@ -502,11 +544,16 @@ export class AgentRuntime {
     this.assertAvailable();
     assertValidSessionId(sessionId);
     const expectedBinding = snapshotSessionBinding(options.expectedBinding);
+    this.assertSessionOwnershipSupported(expectedBinding);
     const operation = this.beginSessionOperation(sessionId, expectedBinding, false);
     try {
       return await this.dependencies.loop.recoverSessionDeferred(sessionId, async () => {
         const session = await this.requireSession(sessionId);
-        assertExpectedBinding(session, expectedBinding);
+        assertExpectedBinding(
+          session,
+          expectedBinding,
+          this.dependencies.sessionStore.supportsSessionOwnership === true,
+        );
       });
     } finally {
       this.endSessionOperation(sessionId, operation);
@@ -515,6 +562,12 @@ export class AgentRuntime {
 
   private assertAvailable(): void {
     if (this.closed) throw new RuntimeClosedError();
+  }
+
+  private assertSessionOwnershipSupported(binding: SessionBinding | undefined): void {
+    if (binding && this.dependencies.sessionStore.supportsSessionOwnership !== true) {
+      throw new SessionOwnershipUnsupportedError();
+    }
   }
 
   private assertSessionNotClosing(
@@ -544,7 +597,13 @@ export class AgentRuntime {
     // awaited here: it may be queued behind the Turn that close must cancel.
     // A mismatched close must never cancel an authorized active Turn.
     let session = await this.dependencies.sessionStore.get(sessionId);
-    if (session) assertExpectedBinding(session, expectedBinding);
+    if (session) {
+      assertExpectedBinding(
+        session,
+        expectedBinding,
+        this.dependencies.sessionStore.supportsSessionOwnership === true,
+      );
+    }
 
     const pending = [...(this.active.get(sessionId) ?? [])];
     this.cancel(sessionId, "Session closed", { expectedBinding });
@@ -556,7 +615,11 @@ export class AgentRuntime {
     // cross the ownership check immediately preceding deletion.
     session = await this.dependencies.sessionStore.get(sessionId);
     if (!session) return false;
-    assertExpectedBinding(session, expectedBinding);
+    assertExpectedBinding(
+      session,
+      expectedBinding,
+      this.dependencies.sessionStore.supportsSessionOwnership === true,
+    );
     return this.dependencies.sessionStore.delete(sessionId);
   }
 
@@ -611,6 +674,9 @@ export class AgentRuntime {
             // the protected owner of the newly-created Session.
             binding: input.expectedBinding,
           }),
+          input.expectedBinding
+            ? { ownership: storedSessionOwnership(input.expectedBinding) }
+            : undefined,
         ),
         preparedSkills,
       };
@@ -668,7 +734,10 @@ export class AgentRuntime {
 
   private toSessionInfo(session: Session, created: boolean): SessionInfo {
     // Validate protected metadata before projecting any part of the record.
-    readSessionBinding(session);
+    readSessionBinding(
+      session,
+      this.dependencies.sessionStore.supportsSessionOwnership === true,
+    );
     const skills = cloneCapabilityScope(readCapabilityScope(session, SESSION_SKILLS, "skill"));
     const tools = cloneCapabilityScope(readCapabilityScope(session, SESSION_TOOLS, "tool"));
     const metadata = structuredClone(session.metadata);
@@ -714,9 +783,16 @@ export class SessionBindingMismatchError extends Error {
   }
 }
 
+export class SessionOwnershipUnsupportedError extends Error {
+  constructor() {
+    super("SessionStore does not support protected Session ownership");
+    this.name = "SessionOwnershipUnsupportedError";
+  }
+}
+
 export class InvalidSessionBindingError extends SessionBindingMismatchError {
   constructor(sessionId: string) {
-    super(sessionId, `Session has invalid persisted binding metadata: ${sessionId}`);
+    super(sessionId, `Session has invalid persisted ownership: ${sessionId}`);
     this.name = "InvalidSessionBindingError";
   }
 }
@@ -799,7 +875,6 @@ function sessionMetadata(
     ...metadata,
     ...(input.tools ? { [SESSION_TOOLS]: [...input.tools] } : {}),
     ...(input.skills ? { [SESSION_SKILLS]: [...input.skills] } : {}),
-    ...(input.binding ? { [SESSION_BINDING]: storedSessionBinding(input.binding) } : {}),
   };
 }
 
@@ -830,11 +905,21 @@ function snapshotPromptInput(input: PromptInput): PromptInput {
 
 function snapshotSessionBinding(binding: SessionBinding | undefined): SessionBinding | undefined {
   if (!binding) return undefined;
-  if (typeof binding.kind !== "string" || binding.kind.length === 0
-    || typeof binding.value !== "string" || binding.value.length === 0) {
-    throw new TypeError("Session binding kind and value must be non-empty strings");
+  try {
+    const ownership = snapshotSessionOwnership({
+      version: SESSION_OWNERSHIP_VERSION,
+      kind: binding.kind,
+      value: binding.value,
+    });
+    if (ownership) return { kind: ownership.kind, value: ownership.value };
+  } catch {
+    throw new TypeError(
+      "Session binding kind and value must be non-empty, NUL-free, well-formed Unicode strings",
+    );
   }
-  return { kind: binding.kind, value: binding.value };
+  throw new TypeError(
+    "Session binding kind and value must be non-empty, NUL-free, well-formed Unicode strings",
+  );
 }
 
 function snapshotLegacySessionBindingMigrationInput(
@@ -853,11 +938,20 @@ function snapshotLegacySessionBindingMigrationInput(
   return { legacyMetadata: { key, value }, binding };
 }
 
-function readSessionBinding(session: Session): SessionBinding | undefined {
+function readSessionBinding(
+  session: Session,
+  supportsSessionOwnership: boolean,
+): SessionBinding | undefined {
+  // This key was previously written through generic metadata and therefore has
+  // no durable provenance. Its presence quarantines the record regardless of
+  // shape, including the exact shape of a current ownership envelope.
+  if (Object.hasOwn(session.metadata, SESSION_BINDING)) {
+    throw new InvalidSessionBindingError(session.id);
+  }
   const hasLegacyMarker = LEGACY_SESSION_BINDING_METADATA.some(
     (key) => Object.hasOwn(session.metadata, key),
   );
-  const binding = readVersionedSessionBinding(session);
+  const binding = readStoredSessionOwnership(session, supportsSessionOwnership);
   // Current writers and the trusted migrator make these representations
   // mutually exclusive. Their coexistence therefore has no trusted provenance.
   if (binding && hasLegacyMarker) throw new InvalidSessionBindingError(session.id);
@@ -868,34 +962,35 @@ function readSessionBinding(session: Session): SessionBinding | undefined {
   return undefined;
 }
 
-function readVersionedSessionBinding(session: Session): SessionBinding | undefined {
-  if (!Object.hasOwn(session.metadata, SESSION_BINDING)) return undefined;
-  const value = session.metadata[SESSION_BINDING];
-  const keys = isRecord(value) ? Reflect.ownKeys(value) : [];
-  if (!isRecord(value)
-    || keys.length !== 3
-    || keys.some((key) => key !== "version" && key !== "kind" && key !== "value")
-    || !Object.hasOwn(value, "version")
-    || !Object.hasOwn(value, "kind")
-    || !Object.hasOwn(value, "value")
-    || value.version !== SESSION_BINDING_VERSION
-    || typeof value.kind !== "string" || value.kind.length === 0
-    || typeof value.value !== "string" || value.value.length === 0) {
+function readStoredSessionOwnership(
+  session: Session,
+  supportsSessionOwnership: boolean,
+): SessionBinding | undefined {
+  if (!Object.hasOwn(session, "ownership")) return undefined;
+  if (!supportsSessionOwnership) throw new InvalidSessionBindingError(session.id);
+  try {
+    const ownership = snapshotSessionOwnership(session.ownership);
+    if (ownership) return { kind: ownership.kind, value: ownership.value };
+  } catch {
     throw new InvalidSessionBindingError(session.id);
   }
-  return { kind: value.kind, value: value.value };
+  throw new InvalidSessionBindingError(session.id);
 }
 
-function storedSessionBinding(binding: SessionBinding): Record<string, unknown> {
+function storedSessionOwnership(binding: SessionBinding): SessionOwnership {
   return {
-    version: SESSION_BINDING_VERSION,
+    version: SESSION_OWNERSHIP_VERSION,
     kind: binding.kind,
     value: binding.value,
   };
 }
 
-function assertExpectedBinding(session: Session, expected: SessionBinding | undefined): void {
-  const actual = readSessionBinding(session);
+function assertExpectedBinding(
+  session: Session,
+  expected: SessionBinding | undefined,
+  supportsSessionOwnership: boolean,
+): void {
+  const actual = readSessionBinding(session, supportsSessionOwnership);
   if (!sameBinding(actual, expected)) {
     throw new SessionBindingMismatchError(session.id);
   }
@@ -929,10 +1024,6 @@ function cloneCapabilityScope(scope: CapabilityScope): CapabilityScope {
   return scope.mode === "all"
     ? { mode: "all" }
     : { mode: "selected", names: [...scope.names] };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function assertUniqueSelection(

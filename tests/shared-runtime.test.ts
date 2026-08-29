@@ -373,6 +373,18 @@ test("HTTP classifies admission failures and redacts internal streaming errors",
       "InvalidCapabilitySelection",
     );
 
+    const clientItems = [];
+    for await (const item of streamRuntimeTurn(url, {
+      sessionId: "unknown-http-client-tool",
+      userInput: "go",
+      tools: ["missing"],
+    })) clientItems.push(item);
+    assert.deepEqual(clientItems, [{
+      type: "error",
+      code: "InvalidCapabilitySelection",
+      message: "Unknown tool capability: missing",
+    }]);
+
     const failedTurn = await fetch(`${url}/v1/turn`, {
       method: "POST",
       headers: { "content-type": "application/json" },

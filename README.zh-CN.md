@@ -55,12 +55,18 @@ Prompt，而不会无限堆积更新。Prompt 支持文本和基础 `resource_li
 Runtime Binding，通用 Session Metadata 无法设置或替换它。Resume、Prompt、Cancel 与 Delete 会原子
 校验同一 Binding，因此伪造 Metadata Key 或 Delete/Recreate 竞态都不能越过 Adapter 所有权边界。
 缺失或外来的 Binding 会被拒绝，且不会泄漏已有 Session 是否属于其他 Workspace。Resume 与 Prompt
-会拒绝不存在的 Session，Delete 则保持幂等。持久化 Binding 使用精确的版本化封装
-`{ version: 1, kind, value }`。旧版裸 `runtime.binding` 与升级前的 `acp.cwd` 都没有可信来源，默认会被
-隔离，并在未绑定 Channel 中表现为 Session 不存在；当前通用 Metadata 也会剥离这两个保留 Key。
-如需保留已确认的旧 ACP Session，宿主必须通过 `authorizeLegacySessionMigration` 按可信 Session-ID
-Allowlist 或外部清单显式授权，不能只依据持久化的 `acp.cwd`。授权后 Runtime 会在同一 Session FIFO
-内重新核验旧 Marker、删除它并只保存一次；若保存结果未知，则原样返回给宿主并要求重新加载确认。
+会拒绝不存在的 Session，Delete 则保持幂等。Binding 使用精确的版本化封装
+`{ version: 1, kind, value }`，并通过 Store 保护的顶层字段（数据库 Store 使用独立列）持久化。可信边界
+是 Store 明确声明的保护能力及其写入路径，而不是 JSON 外形；通用 Metadata 中任意形状的
+`runtime.binding` 与升级前的 `acp.cwd` 都没有可信来源，默认会被隔离，并在未绑定 Channel 中表现为
+Session 不存在。当前通用 Metadata 也会剥离这两个保留 Key；自定义 Session Store 必须显式实现原子
+创建/认领的保护契约后才能使用 Runtime Binding。File Store 也会忽略旧版原始 Session JSON 中的
+`ownership`；只有带新 magic framing 的容器才具有受保护来源。如需保留已确认的旧 ACP Session，
+宿主必须通过 `authorizeLegacySessionMigration` 按可信 Session-ID Allowlist 或外部清单显式授权，
+不能只依据持久化的
+`acp.cwd`。授权后 Runtime 会在同一 Session FIFO 内重新核验旧 Marker、删除它并只保存一次；若保存
+结果未知，则原样返回给宿主并要求重新加载确认。回调会收到 `AbortSignal`；Delete 与断连会取消并等待
+尚未完成的授权，Delete 期间同一 Session 的新 Resume/Prompt 也不会被接纳。
 
 `session/cancel` 只影响由当前 Adapter 接纳的 Prompt。要把 Runtime 审批桥接到当前 ACP Client，
 构建 `AgentLoop` 与 ACP Adapter 时必须使用同一个 `AcpPermissionBridge`。下例假设 `model`、`tools`
@@ -150,7 +156,7 @@ Channel C ─┘
 - 托管数据库在启动时按 PostgreSQL > Supabase > SQLite 选择，失败时不自动回退
 - 模型请求、恢复和终态策略只返回计划，统一由 `AgentLoop` 应用并持久化
 - 同一 Session 的 Turn 与恢复共用 FIFO，不同 Session 并发执行
-- 仅接受格式完好的 Unicode Session ID，File Store 使用固定长度摘要路径并核对文件内规范 ID
+- 仅接受非空、不含 NUL 且格式完好的 Unicode Session ID，File Store 使用固定长度摘要路径并核对文件内规范 ID
 
 ## 架构
 
@@ -266,7 +272,8 @@ PostgreSQL 引擎默认以 `schemaMode: "check"` 启动。DDL 应通过部署步
 `migratePostgresSchema(...)`，或为 Profile 显式设置 `schemaMode: "migrate"`；可选的
 `migrationConnectionString`/`migrationUrl` 可把迁移所需的高权限凭据与 Runtime 凭据分离。
 该显式调用应置于部署流水线；Supabase 提供了[数据库迁移流程](https://supabase.com/docs/guides/deployment/database-migrations)
-说明。`openSessionStore` 会在返回前完成 Readiness 检查。
+说明。`openSessionStore` 会在返回前完成 Readiness 检查，包括迁移完整性及文档列出的每一项 Runtime
+Schema/Table 权限。
 
 独立迁移 API 也要求显式 Profile，因此 Supabase 会保持相同的安全 TLS 默认值：
 
@@ -362,8 +369,9 @@ Session 只读 Tool 接收与 Runtime 隔离、深度冻结的 Session 快照。
 属于受信任的 Runtime 扩展：它可以访问 live Session，并相对于同批其他工具以独占屏障执行。
 Tool 结果必须能够 JSON 序列化；非法结果会成为模型可见的 Tool Failure，而不会破坏持久化状态。
 其检查点会重写完整消息历史，保证已有消息的修改在不同 Store 中具有一致的持久化语义。由于它是
-宿主信任的代码，也可以有意修改 Session Metadata，包括 Runtime 保留的所有权或能力字段；后续排队
-的授权会在 FIFO 槽位内观察到已持久化的变化。
+宿主信任的代码，也可以有意修改 Session Metadata，包括 Runtime 保留的能力字段；后续排队的授权
+会在 FIFO 槽位内观察到已持久化的变化。但普通检查点不能替换 Store 保护的 Ownership；尝试修改会
+让保存失败，而不会改变 Adapter 所有权。
 
 `sessionAccess` 不代表工具没有外部副作用。需要保证外部执行顺序的 Tool 应声明
 `executionPolicy: "exclusive"`；只有允许重叠和乱序的 Tool 才使用默认并行策略。Bash 为独占执行，

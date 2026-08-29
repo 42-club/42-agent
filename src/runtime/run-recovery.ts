@@ -2,7 +2,6 @@ import type {
   DeepReadonly,
   Message,
   RunState,
-  Session,
 } from "../session.js";
 
 export interface RecoveryResult {
@@ -10,8 +9,14 @@ export interface RecoveryResult {
   interruptedToolCalls: number;
 }
 
+export interface RunPolicySessionSnapshot {
+  id: string;
+  messages: Message[];
+  runState?: RunState;
+}
+
 export interface RunRecoverySnapshot {
-  session?: DeepReadonly<Session>;
+  session?: DeepReadonly<RunPolicySessionSnapshot>;
   now: string;
 }
 

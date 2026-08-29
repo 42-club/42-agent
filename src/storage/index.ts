@@ -6,6 +6,7 @@ export { openSessionStore } from "./factory.js";
 export {
   migratePostgresSchema,
   PostgresSchemaMigrationRequiredError,
+  PostgresSchemaPermissionError,
   PostgresSchemaVersionError,
 } from "./postgres-migrations.js";
 export {

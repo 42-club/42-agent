@@ -10,6 +10,7 @@ import {
   type ModelClient,
   type SkillCatalog,
   type Session,
+  type SessionCreateOptions,
   type SaveSessionOptions,
   type SessionStore,
   type Tool,
@@ -69,13 +70,18 @@ function createRuntime(model: ModelClient) {
 }
 
 class OutcomeUnknownMigrationStore implements SessionStore {
+  readonly supportsSessionOwnership = true as const;
   readonly error = new SessionSaveOutcomeUnknownError("migration save outcome is unknown");
   saveCalls = 0;
   private readonly base = new InMemorySessionStore();
 
   get(sessionId: string) { return this.base.get(sessionId); }
-  create(sessionId: string, metadata?: Record<string, unknown>) {
-    return this.base.create(sessionId, metadata);
+  create(
+    sessionId: string,
+    metadata?: Record<string, unknown>,
+    options?: SessionCreateOptions,
+  ) {
+    return this.base.create(sessionId, metadata, options);
   }
   getOrCreate(sessionId: string) { return this.base.getOrCreate(sessionId); }
   delete(sessionId: string) { return this.base.delete(sessionId); }
@@ -632,8 +638,12 @@ test("reserved Session binding cannot be forged through generic metadata", async
   assert.equal(created.metadata["acp.cwd"], undefined);
   assert.equal(created.metadata.visible, "kept");
   assert.deepEqual(
-    (await sessionStore.get("protected-binding"))?.metadata["runtime.binding"],
+    (await sessionStore.get("protected-binding"))?.ownership,
     { version: 1, ...binding },
+  );
+  assert.equal(
+    (await sessionStore.get("protected-binding"))?.metadata["runtime.binding"],
+    undefined,
   );
   assert.equal(
     (await sessionStore.get("protected-binding"))?.metadata["acp.cwd"],
@@ -653,6 +663,61 @@ test("reserved Session binding cannot be forged through generic metadata", async
     runtime.resumeSession("forged-binding-only", { expectedBinding: binding }),
     { name: "SessionBindingMismatchError" },
   );
+  await assert.rejects(
+    runtime.createSession({
+      sessionId: "invalid-binding-string",
+      binding: { kind: "test\0adapter", value: "owner-a" },
+    }),
+    TypeError,
+  );
+  assert.equal(await sessionStore.get("invalid-binding-string"), undefined);
+});
+
+test("Runtime trusts top-level ownership only from a capable Store", async () => {
+  const binding = { kind: "test-adapter", value: "owner-a" };
+  const session: Session = {
+    id: "uncapable-ownership",
+    messages: [],
+    metadata: {},
+    ownership: { version: 1, ...binding },
+  };
+  let getCalls = 0;
+  let createCalls = 0;
+  const sessionStore: SessionStore = {
+    async get() {
+      getCalls += 1;
+      return session;
+    },
+    async create() {
+      createCalls += 1;
+      return session;
+    },
+    async getOrCreate() { return session; },
+    async save() {},
+    async delete() { return false; },
+  };
+  const loop = new AgentLoop({
+    model: { async complete() { return { content: "unused" }; } },
+    sessionStore,
+    tools: new ToolRegistry(),
+    requestApproval: async () => false,
+  });
+  const runtime = new AgentRuntime({ loop });
+
+  await assert.rejects(
+    runtime.resumeSession(session.id, { expectedBinding: binding }),
+    { name: "SessionOwnershipUnsupportedError" },
+  );
+  assert.equal(getCalls, 0);
+  await assert.rejects(
+    runtime.resumeSession(session.id),
+    { name: "InvalidSessionBindingError" },
+  );
+  await assert.rejects(
+    runtime.createSession({ sessionId: "uncapable-create", binding }),
+    { name: "SessionOwnershipUnsupportedError" },
+  );
+  assert.equal(createCalls, 0);
 });
 
 test("legacy ACP ownership stays quarantined until an exact trusted FIFO migration", async () => {
@@ -709,7 +774,8 @@ test("legacy ACP ownership stays quarantined until an exact trusted FIFO migrati
   const stored = await sessionStore.get("legacy-acp-session");
   assert.equal(stored?.version, 1);
   assert.equal(stored?.metadata["acp.cwd"], undefined);
-  assert.deepEqual(stored?.metadata["runtime.binding"], { version: 1, ...binding });
+  assert.equal(stored?.metadata["runtime.binding"], undefined);
+  assert.deepEqual(stored?.ownership, { version: 1, ...binding });
 
   await assert.rejects(
     runtime.resumeSession("legacy-acp-session"),
@@ -770,7 +836,7 @@ test("bare pre-version binding metadata cannot be promoted as trusted ownership"
       legacyMetadata: { key: "acp.cwd", value: workspace },
       binding,
     }),
-    { name: "SessionBindingMismatchError" },
+    { name: "InvalidSessionBindingError" },
   );
 });
 
@@ -796,8 +862,12 @@ test("legacy binding migration propagates an unknown save outcome without retryi
   );
   assert.equal(sessionStore.saveCalls, 1);
   assert.deepEqual(
-    (await sessionStore.get("unknown-migration"))?.metadata["runtime.binding"],
+    (await sessionStore.get("unknown-migration"))?.ownership,
     { version: 1, ...binding },
+  );
+  assert.equal(
+    (await sessionStore.get("unknown-migration"))?.metadata["runtime.binding"],
+    undefined,
   );
   assert.equal((await runtime.resumeSession("unknown-migration", {
     expectedBinding: binding,
@@ -1359,4 +1429,60 @@ test("Session close cancels an active Turn before awaiting queued recovery", asy
   await assert.rejects(running, { name: "AbortError" });
   assert.deepEqual(await recovery, { recovered: false, interruptedToolCalls: 0 });
   assert.equal(await closing, true);
+});
+
+test("Session close cancels an active Turn before awaiting queued binding migration", async () => {
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  let markAborted!: () => void;
+  const aborted = new Promise<void>((resolve) => { markAborted = resolve; });
+  const events: string[] = [];
+  const { runtime, sessionStore } = createRuntime({
+    async complete({ signal }) {
+      markStarted();
+      return new Promise((_resolve, reject) => {
+        const abort = (): void => {
+          events.push("model-aborted");
+          markAborted();
+          reject(signal?.reason);
+        };
+        if (signal?.aborted) abort();
+        else signal?.addEventListener("abort", abort, { once: true });
+      });
+    },
+  });
+  const sessionId = "close-beats-binding-migration";
+  const workspace = "/trusted/workspace";
+  const binding = { kind: "acp.workspace", value: workspace };
+  await runtime.createSession({ sessionId, binding });
+  const running = runtime.prompt({
+    sessionId,
+    expectedBinding: binding,
+    content: [{ type: "text", text: "wait" }],
+  });
+  const runningRejected = assert.rejects(running, { name: "AbortError" });
+  await started;
+
+  let migrationSettled = false;
+  const migrating = runtime.migrateLegacySessionBinding(sessionId, {
+    legacyMetadata: { key: "acp.cwd", value: workspace },
+    binding,
+  }).then((result) => {
+    migrationSettled = true;
+    events.push("migration-settled");
+    return result;
+  });
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.equal(migrationSettled, false);
+
+  const closing = runtime.closeSession(sessionId, { expectedBinding: binding }).then((deleted) => {
+    events.push("close-settled");
+    return deleted;
+  });
+  await aborted;
+  await runningRejected;
+  assert.equal((await migrating).created, false);
+  assert.equal(await closing, true);
+  assert.deepEqual(events, ["model-aborted", "migration-settled", "close-settled"]);
+  assert.equal(await sessionStore.get(sessionId), undefined);
 });

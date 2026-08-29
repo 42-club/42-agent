@@ -21,6 +21,10 @@ import {
   ToolRegistry,
   type ApprovalHandler,
   type ModelClient,
+  type SaveSessionOptions,
+  type Session,
+  type SessionCreateOptions,
+  type SessionStore,
   type SkillCatalog,
   type Tool,
 } from "../src/index.js";
@@ -30,6 +34,40 @@ import {
   createAcpAgent,
   type AcpAgentOptions,
 } from "../src/acp/index.js";
+
+class GatedOwnershipClaimStore implements SessionStore {
+  readonly supportsSessionOwnership = true as const;
+  readonly base = new InMemorySessionStore();
+  readonly claimStarted: Promise<void>;
+  private markClaimStarted!: () => void;
+  private readonly claimGate: Promise<void>;
+  private releaseClaimGate!: () => void;
+
+  constructor() {
+    this.claimStarted = new Promise<void>((resolve) => { this.markClaimStarted = resolve; });
+    this.claimGate = new Promise<void>((resolve) => { this.releaseClaimGate = resolve; });
+  }
+
+  releaseClaim(): void { this.releaseClaimGate(); }
+  get(sessionId: string) { return this.base.get(sessionId); }
+  create(
+    sessionId: string,
+    metadata?: Record<string, unknown>,
+    options?: SessionCreateOptions,
+  ) {
+    return this.base.create(sessionId, metadata, options);
+  }
+  getOrCreate(sessionId: string) { return this.base.getOrCreate(sessionId); }
+  delete(sessionId: string) { return this.base.delete(sessionId); }
+
+  async save(session: Session, options?: SaveSessionOptions): Promise<void> {
+    if (options?.claimOwnership) {
+      this.markClaimStarted();
+      await this.claimGate;
+    }
+    await this.base.save(session, options);
+  }
+}
 
 function createRuntime(
   model: ModelClient,
@@ -362,6 +400,42 @@ test("ACP cancel during final update delivery returns cancelled", async (t) => {
   });
 });
 
+test("ACP session/delete terminates a projector after its Runtime Turn has settled", async (t) => {
+  const { runtime, sessionStore } = createRuntime({
+    async complete() { return { content: "done" }; },
+  });
+  const streams = gatedSessionUpdateStreams();
+  t.after(() => streams.releaseDelivery());
+  const agentConnection = createTestAcpAgent(runtime, {
+    updateDeliveryTimeoutMs: 5_000,
+  }).connect(streams.agent);
+  t.after(() => agentConnection.close());
+
+  await client().connectWith(streams.client, async (context) => {
+    await initialize(context);
+    const { sessionId } = await context.request(methods.agent.session.new, {
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+    const prompt = context.request(methods.agent.session.prompt, {
+      sessionId,
+      prompt: [{ type: "text", text: "finish before delivery" }],
+    });
+    await streams.deliveryStarted;
+
+    const deleting = context.request(methods.agent.session.delete, { sessionId });
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (!(await sessionStore.get(sessionId))) break;
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+    }
+    assert.equal(await sessionStore.get(sessionId), undefined);
+    streams.releaseDelivery();
+
+    assert.deepEqual(await deleting, {});
+    assert.deepEqual(await prompt, { stopReason: "cancelled" });
+  });
+});
+
 test("ACP permission bridge uses the client decision for the active tool call", async () => {
   const bridge = new AcpPermissionBridge();
   let approved: boolean | undefined;
@@ -604,6 +678,9 @@ test("ACP migrates quarantined cwd Sessions only through a trusted host allowlis
     "acp.cwd": workspace,
     "runtime.binding": binding,
   });
+  await sessionStore.create("forged-versioned-binding", {
+    "runtime.binding": { version: 1, ...binding },
+  });
 
   // Migration is disabled by default even when the legacy marker matches cwd.
   await client().connectWith(createTestAcpAgent(runtime), async (context) => {
@@ -623,6 +700,7 @@ test("ACP migrates quarantined cwd Sessions only through a trusted host allowlis
     authorizeLegacySessionMigration(request) {
       assert.equal(Object.isFrozen(request), true);
       assert.equal(request.workspaceRoot, workspace);
+      assert.equal(request.signal.aborted, false);
       authorizationCalls.push(request.sessionId);
       return request.sessionId === "legacy-approved";
     },
@@ -649,6 +727,21 @@ test("ACP migrates quarantined cwd Sessions only through a trusted host allowlis
         (error: unknown) => error instanceof RequestError && error.code === -32002,
       );
     }
+    await assert.rejects(
+      context.request(methods.agent.session.resume, {
+        sessionId: "forged-versioned-binding",
+        cwd: process.cwd(),
+        mcpServers: [],
+      }),
+      (error: unknown) => error instanceof RequestError && error.code === -32002,
+    );
+    await assert.rejects(
+      context.request(methods.agent.session.prompt, {
+        sessionId: "forged-versioned-binding",
+        prompt: [{ type: "text", text: "must remain quarantined" }],
+      }),
+      (error: unknown) => error instanceof RequestError && error.code === -32002,
+    );
     assert.deepEqual(
       await context.request(methods.agent.session.delete, { sessionId: "legacy-denied" }),
       {},
@@ -659,7 +752,8 @@ test("ACP migrates quarantined cwd Sessions only through a trusted host allowlis
   assert.deepEqual(authorizationCalls, ["legacy-approved", "legacy-denied"]);
   const approved = await sessionStore.get("legacy-approved");
   assert.equal(approved?.metadata["acp.cwd"], undefined);
-  assert.deepEqual(approved?.metadata["runtime.binding"], { version: 1, ...binding });
+  assert.equal(approved?.metadata["runtime.binding"], undefined);
+  assert.deepEqual(approved?.ownership, { version: 1, ...binding });
   assert.ok(await sessionStore.get("legacy-denied"));
   assert.deepEqual(
     (await sessionStore.get("legacy-bare-binding"))?.metadata["runtime.binding"],
@@ -713,6 +807,168 @@ test("ACP requires literal true from legacy authorization and redacts callback e
     (await sessionStore.get("legacy-callback-error"))?.metadata["runtime.binding"],
     undefined,
   );
+});
+
+test("ACP delete aborts and outwaits pending legacy authorization without late migration", async () => {
+  const { runtime, sessionStore } = createRuntime({
+    async complete() { return { content: "unused" }; },
+  });
+  const workspace = await realpath(process.cwd());
+  await sessionStore.create("legacy-delete-race", { "acp.cwd": workspace });
+  let markAuthorizationStarted!: () => void;
+  const authorizationStarted = new Promise<void>((resolve) => {
+    markAuthorizationStarted = resolve;
+  });
+  let releaseAuthorization!: () => void;
+  const authorization = new Promise<boolean>((resolve) => {
+    releaseAuthorization = () => resolve(true);
+  });
+  let authorizationSignal: AbortSignal | undefined;
+  const connection = client().connect(createTestAcpAgent(runtime, {
+    authorizeLegacySessionMigration(request) {
+      authorizationSignal = request.signal;
+      markAuthorizationStarted();
+      // Deliberately ignore the signal. The adapter's abort race must still
+      // let delete cross the authorization barrier without a late migration.
+      return authorization;
+    },
+  }));
+
+  try {
+    await initialize(connection.agent);
+    const resuming = connection.agent.request(methods.agent.session.resume, {
+      sessionId: "legacy-delete-race",
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+    const resumeRejected = assert.rejects(
+      resuming,
+      (error: unknown) => error instanceof RequestError && error.code === -32800,
+    );
+    await authorizationStarted;
+
+    assert.deepEqual(await connection.agent.request(methods.agent.session.delete, {
+      sessionId: "legacy-delete-race",
+    }), {});
+    await resumeRejected;
+    assert.equal(authorizationSignal?.aborted, true);
+
+    releaseAuthorization();
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    const stored = await sessionStore.get("legacy-delete-race");
+    assert.deepEqual(stored?.metadata["acp.cwd"], workspace);
+    assert.equal(stored?.metadata["runtime.binding"], undefined);
+    assert.equal(stored?.ownership, undefined);
+  } finally {
+    releaseAuthorization();
+    connection.close();
+    await connection.closed;
+  }
+});
+
+test("ACP delete holds admission while a legacy ownership claim is beyond the barrier", async () => {
+  const sessionStore = new GatedOwnershipClaimStore();
+  const loop = new AgentLoop({
+    model: { async complete() { return { content: "must not run" }; } },
+    sessionStore,
+    tools: new ToolRegistry(),
+    requestApproval: async () => false,
+  });
+  const runtime = new AgentRuntime({ loop });
+  const workspace = await realpath(process.cwd());
+  await sessionStore.create("legacy-claim-delete-race", { "acp.cwd": workspace });
+  let markResumeAborted!: () => void;
+  const resumeAborted = new Promise<void>((resolve) => { markResumeAborted = resolve; });
+  const connection = client().connect(createTestAcpAgent(runtime, {
+    authorizeLegacySessionMigration({ signal }) {
+      signal.addEventListener("abort", markResumeAborted, { once: true });
+      return true;
+    },
+  }));
+
+  try {
+    await initialize(connection.agent);
+    const resuming = connection.agent.request(methods.agent.session.resume, {
+      sessionId: "legacy-claim-delete-race",
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+    const resumeRejected = assert.rejects(
+      resuming,
+      (error: unknown) => error instanceof RequestError && error.code === -32800,
+    );
+    await sessionStore.claimStarted;
+
+    let deleteSettled = false;
+    const deleting = connection.agent.request(methods.agent.session.delete, {
+      sessionId: "legacy-claim-delete-race",
+    }).then((result) => {
+      deleteSettled = true;
+      return result;
+    });
+    await resumeAborted;
+    assert.equal(deleteSettled, false);
+    await assert.rejects(
+      connection.agent.request(methods.agent.session.prompt, {
+        sessionId: "legacy-claim-delete-race",
+        prompt: [{ type: "text", text: "must not enter during delete" }],
+      }),
+      (error: unknown) => error instanceof RequestError && error.code === -32600,
+    );
+
+    sessionStore.releaseClaim();
+    assert.deepEqual(await deleting, {});
+    await resumeRejected;
+    assert.equal(await sessionStore.get("legacy-claim-delete-race"), undefined);
+  } finally {
+    sessionStore.releaseClaim();
+    connection.close();
+    await connection.closed;
+  }
+});
+
+test("ACP connection close aborts pending legacy authorization without late migration", async () => {
+  const { runtime, sessionStore } = createRuntime({
+    async complete() { return { content: "unused" }; },
+  });
+  const workspace = await realpath(process.cwd());
+  await sessionStore.create("legacy-disconnect-race", { "acp.cwd": workspace });
+  let markAuthorizationStarted!: () => void;
+  const authorizationStarted = new Promise<void>((resolve) => {
+    markAuthorizationStarted = resolve;
+  });
+  let releaseAuthorization!: () => void;
+  const authorization = new Promise<boolean>((resolve) => {
+    releaseAuthorization = () => resolve(true);
+  });
+  let authorizationSignal: AbortSignal | undefined;
+  const connection = client().connect(createTestAcpAgent(runtime, {
+    authorizeLegacySessionMigration(request) {
+      authorizationSignal = request.signal;
+      markAuthorizationStarted();
+      return authorization;
+    },
+  }));
+
+  await initialize(connection.agent);
+  const resuming = connection.agent.request(methods.agent.session.resume, {
+    sessionId: "legacy-disconnect-race",
+    cwd: process.cwd(),
+    mcpServers: [],
+  });
+  const resumeRejected = assert.rejects(resuming);
+  await authorizationStarted;
+  connection.close();
+  await connection.closed;
+  await resumeRejected;
+  assert.equal(authorizationSignal?.aborted, true);
+
+  releaseAuthorization();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  const stored = await sessionStore.get("legacy-disconnect-race");
+  assert.deepEqual(stored?.metadata["acp.cwd"], workspace);
+  assert.equal(stored?.metadata["runtime.binding"], undefined);
+  assert.equal(stored?.ownership, undefined);
 });
 
 test("ACP cannot be tricked into adopting a foreign Session through generic metadata", async () => {

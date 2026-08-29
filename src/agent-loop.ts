@@ -20,7 +20,11 @@ import { ModelRunner } from "./runtime/model-runner.js";
 import { RetryPolicy, type RetryPolicyOptions, throwIfAborted } from "./runtime/retry.js";
 import { normalizeRuntimeError } from "./runtime/errors.js";
 import { RunFinalizer } from "./runtime/run-finalizer.js";
-import { RunRecovery, type RecoveryResult } from "./runtime/run-recovery.js";
+import {
+  RunRecovery,
+  type RecoveryResult,
+  type RunPolicySessionSnapshot,
+} from "./runtime/run-recovery.js";
 import { SteeringQueue } from "./runtime/steering.js";
 import { CoordinatedToolExecutor } from "./runtime/tool-executor.js";
 import {
@@ -164,7 +168,7 @@ export class AgentLoop {
   private async recoverSessionSerialized(sessionId: string): Promise<RecoveryResult> {
     const session = await this.dependencies.sessionStore.get(sessionId);
     const plan = this.runRecovery.plan(immutableSnapshot({
-      session,
+      session: session ? runPolicySessionSnapshot(session) : undefined,
       now: new Date().toISOString(),
     }));
     if (plan.kind === "noop") return plan.result;
@@ -342,7 +346,7 @@ export class AgentLoop {
 
         const plan = this.runFinalizer.plan(immutableSnapshot({
           kind: "completed" as const,
-          session,
+          session: runPolicySessionSnapshot(session),
           content,
           now: new Date().toISOString(),
         }));
@@ -375,7 +379,7 @@ export class AgentLoop {
       // the terminal Run so the next model request never sees orphaned calls.
       const plan = this.runFinalizer.plan(immutableSnapshot({
         kind: "failed" as const,
-        session,
+        session: runPolicySessionSnapshot(session),
         cancelled,
         errorMessage: error instanceof Error ? error.message : String(error),
         error: normalizeRuntimeError(error),
@@ -576,17 +580,24 @@ export class AgentLoop {
 
   private createRunMutationGate(session: Session): RunMutationGate {
     let persistenceTail: Promise<void> = Promise.resolve();
+    let outcomeUnknown: SessionSaveOutcomeUnknownError | undefined;
     const checkpoint = async (
       mutate?: () => void,
       options?: SaveSessionOptions,
     ): Promise<void> => {
-      const pending = persistenceTail
-        .catch(() => undefined)
-        .then(async () => {
-          mutate?.();
-          await this.dependencies.sessionStore.save(session, options);
-        });
-      persistenceTail = pending.catch(() => undefined);
+      const pending = persistenceTail.then(async () => {
+        if (outcomeUnknown) throw outcomeUnknown;
+        mutate?.();
+        await this.dependencies.sessionStore.save(session, options);
+      });
+      persistenceTail = pending.then(
+        () => undefined,
+        (error: unknown) => {
+          if (error instanceof SessionSaveOutcomeUnknownError) outcomeUnknown ??= error;
+          // Definite checkpoint failures remain recoverable: terminal
+          // reconciliation may safely persist the current in-memory state.
+        },
+      );
       await pending;
     };
     return Object.freeze({ checkpoint });
@@ -666,6 +677,14 @@ function normalizeToolCalls(calls: readonly ToolCall[] | undefined): ToolCall[] 
 
 function immutableSnapshot<T>(value: T): T {
   return deepFreeze(structuredClone(value));
+}
+
+function runPolicySessionSnapshot(session: Session): RunPolicySessionSnapshot {
+  return {
+    id: session.id,
+    messages: session.messages,
+    runState: session.runState,
+  };
 }
 
 function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {

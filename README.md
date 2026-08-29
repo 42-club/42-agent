@@ -66,17 +66,22 @@ metadata key or a delete/recreate race cannot cross adapter ownership. Missing o
 rejected without exposing whether an existing Session is foreign. Resume and prompt reject a nonexistent
 Session, while delete remains idempotent. `session/cancel` affects only a prompt admitted by this adapter.
 
-The persisted binding is an exact versioned envelope (`{ version: 1, kind, value }`). This envelope is the
-trust boundary for the binding format introduced in this unreleased change: an older bare
-`runtime.binding` object is quarantined rather than promoted. Sessions created by the previous ACP adapter
-carry only `acp.cwd`; that key was generic metadata and is therefore also insufficient proof of ownership.
-Both legacy forms are hidden from unbound channels as missing Sessions, and current generic metadata strips
-both reserved keys. To retain a known pre-upgrade ACP Session, supply
+The binding is an exact versioned envelope (`{ version: 1, kind, value }`) persisted through a
+Store-protected top-level field (and an independent column in database Stores). The trust boundary is that
+protected Store capability and write path, not the JSON shape: every `runtime.binding` value in generic
+metadata is quarantined rather than promoted. Sessions created by the previous ACP adapter carry only
+`acp.cwd`; that key was also generic metadata and is insufficient proof of ownership. Both legacy forms are
+hidden from unbound channels as missing Sessions, and current generic metadata strips both reserved keys.
+The File Store likewise ignores `ownership` found in an older raw Session JSON file; only its new
+magic-framed container carries protected provenance.
+Custom Session Stores must explicitly implement the protected atomic create/claim contract before Runtime
+bindings can be used. To retain a known pre-upgrade ACP Session, supply
 `authorizeLegacySessionMigration` with a trusted Session-ID allowlist or equivalent external inventory.
 Approval must not be based only on the stored `acp.cwd` or requested workspace. After approval, the Runtime
 re-checks the exact marker inside the per-Session FIFO, removes it, and performs one versioned save. An
 outcome-unknown save is returned to the host without retry; reload the Session to learn whether the binding
-became durable.
+became durable. The callback receives an `AbortSignal`; delete and disconnect cancel and join pending
+authorization, while delete blocks new resume/prompt admission for that Session.
 
 To bridge Runtime approvals to the active ACP client, use the same `AcpPermissionBridge` when
 constructing both `AgentLoop` and the adapter. The snippet assumes `model`, `tools`, and `sessionStore`
@@ -167,7 +172,7 @@ channel C ─┘
 - managed database startup selection with PostgreSQL > Supabase > SQLite priority and no failure fallback
 - pure model-request, recovery, and finalization policy plans applied and checkpointed only by `AgentLoop`
 - per-session FIFO turns and recovery while different sessions remain concurrent
-- well-formed Unicode Session IDs with collision-checked, fixed-length File Store paths
+- non-empty, NUL-free, well-formed Unicode Session IDs with collision-checked, fixed-length File Store paths
 
 ## Architecture
 
@@ -293,7 +298,8 @@ with `migratePostgresSchema(...)`, or opt a profile into `schemaMode: "migrate"`
 `migrationConnectionString`/`migrationUrl` can keep elevated migration credentials separate from runtime
 credentials. Put that explicit invocation in the deployment pipeline; Supabase documents its [database
 migration workflow](https://supabase.com/docs/guides/deployment/database-migrations). `openSessionStore`
-performs its readiness check before returning.
+performs its readiness check before returning, including migration integrity and every documented runtime
+schema/table privilege.
 
 The standalone migration API is profile-aware, so Supabase retains the same secure TLS default:
 
@@ -394,8 +400,10 @@ Session-read-only tools receive a detached, deeply frozen Session snapshot. A to
 exclusive barrier relative to the rest of its tool batch. Tool results must be JSON-serializable; invalid
 results become model-visible tool failures instead of corrupting persistence. Its checkpoint rewrites the
 complete message history so mutations are durable consistently across Store implementations. Because this
-is host-trusted code, it can intentionally change Session metadata, including Runtime-reserved ownership or
-capability fields; subsequent queued authorization runs in FIFO order and observes the persisted change.
+is host-trusted code, it can intentionally change Session metadata, including Runtime-reserved capability
+fields; subsequent queued authorization runs in FIFO order and observes the persisted change. It cannot
+replace Store-protected ownership through a normal checkpoint: an attempted change fails the save instead
+of changing adapter ownership.
 
 `sessionAccess` says nothing about external side effects. Tools that must preserve external ordering use
 `executionPolicy: "exclusive"`; only tools safe to overlap and reorder should use the default parallel

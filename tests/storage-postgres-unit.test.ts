@@ -55,6 +55,21 @@ test("unverified COMMIT is surfaced as unknown and is never retried", async () =
   await store.close();
 });
 
+test("a failed pre-COMMIT rollback destroys the transaction client", async () => {
+  const fixture = rollbackFailurePool();
+  const store = new PostgresSessionStore({
+    connectionString: "postgresql://runtime@localhost/agent",
+    namespace: "rollback-failure",
+    pool: fixture.pool,
+  });
+  const session = { id: "session", version: 0, messages: [], metadata: {} };
+
+  await assert.rejects(store.save(session), (error) => error === fixture.checkpointError);
+  assert.equal(fixture.rollbackAttempts, 1);
+  assert.equal(fixture.releaseDestroyed, true);
+  await store.close();
+});
+
 function uncertainCommitPool(confirmCheckpoint: boolean): {
   pool: Pool;
   events: EventEmitter;
@@ -82,7 +97,7 @@ function uncertainCommitPool(confirmCheckpoint: boolean): {
       if (sql.includes("FROM agent_runtime.messages")) return result([]);
       if (sql.includes("UPDATE agent_runtime.sessions")) {
         nextVersion = Number(values[2]);
-        checkpointId = String(values[5]);
+        checkpointId = String(values[6]);
         return result([], 1);
       }
       if (sql === "COMMIT") throw new Error("connection lost after COMMIT was sent");
@@ -123,6 +138,46 @@ function uncertainCommitPool(confirmCheckpoint: boolean): {
     get verificationCount() {
       return verificationCount;
     },
+  };
+}
+
+function rollbackFailurePool(): {
+  pool: Pool;
+  checkpointError: Error;
+  readonly rollbackAttempts: number;
+  readonly releaseDestroyed: boolean;
+} {
+  const events = new EventEmitter();
+  const checkpointError = new Error("checkpoint write failed");
+  let rollbackAttempts = 0;
+  let releaseDestroyed = false;
+  const client = {
+    async query(sql: string) {
+      if (sql === "BEGIN") return result();
+      if (sql.includes("SELECT version") && sql.includes("FOR UPDATE")) {
+        return result([{ version: 0 }]);
+      }
+      if (sql.includes("FROM agent_runtime.messages")) return result([]);
+      if (sql.includes("UPDATE agent_runtime.sessions")) throw checkpointError;
+      if (sql === "ROLLBACK") {
+        rollbackAttempts += 1;
+        throw new Error("rollback failed");
+      }
+      throw new Error(`Unexpected transaction query: ${sql}`);
+    },
+    release(destroy?: boolean) {
+      releaseDestroyed = destroy === true;
+    },
+  };
+  const pool = Object.assign(events, {
+    async connect() { return client; },
+    async end() {},
+  }) as unknown as Pool;
+  return {
+    pool,
+    checkpointError,
+    get rollbackAttempts() { return rollbackAttempts; },
+    get releaseDestroyed() { return releaseDestroyed; },
   };
 }
 

@@ -1,6 +1,7 @@
 import type { ToolCall } from "../model.js";
 import {
   createMessage,
+  SessionSaveOutcomeUnknownError,
   type RunState,
   type SaveSessionOptions,
   type Session,
@@ -40,6 +41,7 @@ interface RunMutationGate {
  */
 export class ToolExecutor {
   private persistenceTail: Promise<void> = Promise.resolve();
+  private readonly outcomeUnknown = new WeakMap<Session, SessionSaveOutcomeUnknownError>();
 
   constructor(
     private readonly tools: ToolRegistry,
@@ -73,13 +75,23 @@ export class ToolExecutor {
     mutate?: () => void,
     options?: SaveSessionOptions,
   ): Promise<void> {
-    const pending = this.persistenceTail
-      .catch(() => undefined)
-      .then(async () => {
-        mutate?.();
-        await this.sessions.save(session, options);
-      });
-    this.persistenceTail = pending.catch(() => undefined);
+    const pending = this.persistenceTail.then(async () => {
+      const outcomeUnknown = this.outcomeUnknown.get(session);
+      if (outcomeUnknown) throw outcomeUnknown;
+      mutate?.();
+      await this.sessions.save(session, options);
+    });
+    this.persistenceTail = pending.then(
+      () => undefined,
+      (error: unknown) => {
+        if (error instanceof SessionSaveOutcomeUnknownError
+          && !this.outcomeUnknown.has(session)) {
+          this.outcomeUnknown.set(session, error);
+        }
+        // A definite failure does not poison the compatibility facade; callers
+        // may still reconcile the live Session in a later checkpoint.
+      },
+    );
     await pending;
   }
 }

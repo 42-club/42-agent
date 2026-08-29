@@ -285,6 +285,7 @@ test("database config rejects missing, partial, and illegal profiles before sele
   const invalid: unknown[] = [
     { namespace: "agent" },
     { namespace: "", sqlite: { filename: "x" } },
+    { namespace: "agent\0tenant", sqlite: { filename: "x" } },
     { namespace: "agent", postgres: {} },
     { namespace: "agent", postgres: { connectionString: "https://example.com/db" } },
     { namespace: "agent", supabase: { databaseUrl: "" } },
@@ -323,6 +324,10 @@ test("database config rejects missing, partial, and illegal profiles before sele
       { name: "DatabaseConfigurationError" },
     );
   }
+  assert.throws(() => new PostgresSessionStore({
+    connectionString: postgres,
+    namespace: "direct\0namespace",
+  }), { name: "DatabaseConfigurationError" });
 });
 
 function effectiveClientSsl(client: Client): unknown {
@@ -337,7 +342,10 @@ test("SQLite factory returns a managed Store with idempotent close", async () =>
     const store = await openSessionStore({ namespace: "local", sqlite: { filename } });
     assert.equal(store.profile, "sqlite");
     assert.equal(store.engine, "sqlite");
-    const session = await store.create("managed");
+    assert.equal(store.supportsSessionOwnership, true);
+    const session = await store.create("managed", {}, {
+      ownership: { version: 1, kind: "adapter", value: "managed-owner" },
+    });
     session.messages.push({ role: "user", content: "hello" });
     await store.save(session);
     const firstClose = store.close();
@@ -347,6 +355,7 @@ test("SQLite factory returns a managed Store with idempotent close", async () =>
 
     const reopened = await openSessionStore({ namespace: "local", sqlite: { filename } });
     assert.equal((await reopened.get("managed"))?.messages[0]?.content, "hello");
+    assert.equal((await reopened.get("managed"))?.ownership?.value, "managed-owner");
     await reopened.close();
   } finally {
     await rm(directory, { recursive: true, force: true });

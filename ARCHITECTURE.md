@@ -95,16 +95,20 @@ are rejected without disclosing their ownership; missing resume/prompt targets f
 idempotent. Cancel targets only prompts admitted with the same binding, and protocol input never widens
 Tool roots.
 
-The protected value is persisted only as the exact versioned envelope `{ version: 1, kind, value }`, which
-is the trust boundary introduced by this unreleased binding format. Neither the former generic `acp.cwd`
-marker nor an older bare `{ kind, value }` `runtime.binding` has trustworthy provenance, so both are
-fail-closed quarantined and unbound protocol adapters project them as missing. Generic Session metadata
-also strips the legacy marker. A host may retain an origin/main-era ACP Session only through the optional
+The protected value is an exact versioned envelope `{ version: 1, kind, value }` persisted through a
+Store-protected top-level field and, for database Stores, an independent column. Trust comes from that
+explicit Store capability and atomic write path, never from the envelope's shape in generic metadata.
+Consequently every generic `runtime.binding` value and the former `acp.cwd` marker lack trustworthy
+provenance; both are fail-closed quarantined and unbound protocol adapters project them as missing. Current
+generic Session metadata strips both keys. A custom Store must implement protected atomic create and
+one-time claim before bindings are enabled. A host may retain an origin/main-era ACP Session only through
+the optional
 `authorizeLegacySessionMigration` callback backed by a trusted Session-ID allowlist or external inventory;
 matching `cwd` metadata alone must never authorize migration. Once approved, `AgentRuntime` re-reads and
 validates the exact legacy marker within the Loop's per-Session FIFO, removes it, and performs a single
 versioned save. Save outcome-unknown is propagated without retry so the host must reload before deciding
-what happened.
+what happened. Pending authorization is an abortable adapter scope: delete/disconnect cancel and join it,
+and delete closes new resume/prompt admission before waiting.
 
 Update projection has a bounded pending count and per-delivery timeout. Backpressure, timeout, transport
 failure, request cancellation, session cancellation/deletion, and Runtime shutdown all terminate the
@@ -154,8 +158,13 @@ substitute for semantic ordering. `save` is update-only: it must fail if the Ses
 version changed. Without `rewriteMessages`, the persisted message prefix is immutable and only appends are
 accepted. File writes use a per-session queue, unique temporary files, fixed-length lowercase Session-ID
 digests with stored-ID verification, and atomic rename within the supported single-process model. Session
-IDs must be non-empty, well-formed Unicode. SQLite stores an explicit current Run ID rather than inferring
-it from wall-clock timestamps.
+IDs must be non-empty, NUL-free, well-formed Unicode. SQLite stores an explicit current Run ID rather than
+inferring it from wall-clock timestamps.
+
+Protected Session ownership is outside generic metadata. Supporting Stores advertise the capability,
+persist ownership atomically at create time or through a one-time versioned claim, and reject ordinary
+saves that add, remove, or replace it. The File Store writes a magic-framed exact container atomically;
+legacy raw Session JSON remains readable, but any top-level `ownership` in that old format is ignored.
 
 ## Database selection and lifecycle
 
@@ -190,7 +199,8 @@ migration API or a deployment step; migration credentials may be separate from r
 Migrations are ordered, checksummed, transactionally applied under a database lock, and reject an unknown
 future version or a changed applied migration. When migration and runtime roles differ, deployment also
 grants the runtime role `USAGE` on the private schema, `SELECT` on migration history for readiness, and DML
-on the four data tables. A Supabase deployment invokes this explicit migration from its deployment
+on the four data tables; readiness verifies each of those privileges before admitting work. A Supabase
+deployment invokes this explicit migration from its deployment
 workflow; the runtime's migration history remains separate from Supabase's own migration table.
 
 The embedding host owns a managed Store. It calls `readinessCheck()` during startup as needed, closes

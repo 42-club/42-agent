@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  AgentLoop,
+  AgentRuntime,
   SessionAlreadyExistsError,
+  ToolRegistry,
   createMessage,
+  type ModelClient,
   type Session,
 } from "../src/index.js";
 import { FileSessionStore } from "../src/storage/index.js";
@@ -159,6 +164,70 @@ test("File store accepts long IDs without exceeding filename component limits", 
   });
 });
 
+test("File store never promotes legacy raw ownership and upgrades only through a protected claim", async () => {
+  await withStoreDirectory(async (directory) => {
+    const sessionId = "legacy-forged-owner";
+    const forgedOwnership = {
+      version: 1 as const,
+      kind: "adapter",
+      value: "forged-owner",
+    };
+    await writeFile(sessionPath(directory, sessionId), JSON.stringify({
+      id: sessionId,
+      version: 0,
+      messages: [],
+      metadata: { source: "legacy-writer" },
+      ownership: forgedOwnership,
+    }, null, 2));
+
+    const store = new FileSessionStore(directory);
+    const legacy = await store.get(sessionId);
+    assert.ok(legacy);
+    assert.equal(legacy.ownership, undefined);
+
+    const model: ModelClient = {
+      async complete() { return { content: "unused" }; },
+    };
+    const tools = new ToolRegistry();
+    const loop = new AgentLoop({
+      model,
+      tools,
+      sessionStore: store,
+      requestApproval: async () => false,
+    });
+    const runtime = new AgentRuntime({ loop });
+    try {
+      await assert.rejects(
+        runtime.resumeSession(sessionId, {
+          expectedBinding: { kind: forgedOwnership.kind, value: forgedOwnership.value },
+        }),
+        { name: "SessionBindingMismatchError" },
+      );
+    } finally {
+      await runtime.close();
+    }
+
+    legacy.ownership = { version: 1, kind: "adapter", value: "trusted-owner" };
+    await store.save(legacy, { claimOwnership: true });
+    const claimed = await new FileSessionStore(directory).get(sessionId);
+    assert.deepEqual(claimed?.ownership, {
+      version: 1,
+      kind: "adapter",
+      value: "trusted-owner",
+    });
+    await assertProtectedContainer(directory, sessionId, true);
+
+    await store.create("new-owned", {}, {
+      ownership: { version: 1, kind: "adapter", value: "new-owner" },
+    });
+    assert.equal(
+      (await new FileSessionStore(directory).get("new-owned"))?.ownership?.value,
+      "new-owner",
+    );
+    await assertProtectedContainer(directory, "new-owned", true);
+  });
+});
+
 async function withStoreDirectory(run: (directory: string) => Promise<void>): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), "42-agent-file-"));
   try {
@@ -166,4 +235,32 @@ async function withStoreDirectory(run: (directory: string) => Promise<void>): Pr
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+}
+
+function sessionPath(directory: string, sessionId: string): string {
+  const digest = createHash("sha256").update(sessionId, "utf8").digest("hex");
+  return join(directory, `${digest}.json`);
+}
+
+async function assertProtectedContainer(
+  directory: string,
+  sessionId: string,
+  hasOwnership: boolean,
+): Promise<void> {
+  const raw = await readFile(sessionPath(directory, sessionId), "utf8");
+  const magic = "42-agent:file-session:v1\n";
+  assert.equal(raw.startsWith(magic), true);
+  const parsed = JSON.parse(raw.slice(magic.length)) as {
+    "$42-agent.file-session": number;
+    session: Record<string, unknown>;
+    ownership?: unknown;
+  };
+  assert.equal(parsed["$42-agent.file-session"], 1);
+  assert.deepEqual(
+    Object.keys(parsed).sort(),
+    (hasOwnership
+      ? ["$42-agent.file-session", "ownership", "session"]
+      : ["$42-agent.file-session", "session"]).sort(),
+  );
+  assert.equal(Object.hasOwn(parsed.session, "ownership"), false);
 }

@@ -85,7 +85,7 @@ export function selectSessionDatabaseConfig(config: SessionDatabaseConfig): {
 
 function validateAndSelect(config: SessionDatabaseConfig): ValidatedConfiguration {
   if (!isRecord(config)) throw new DatabaseConfigurationError("Database config must be an object");
-  const namespace = validateNamespace(config.namespace);
+  const namespace = validateDatabaseNamespace(config.namespace);
   const mode = config.mode ?? "auto";
   if (!SELECTION_MODES.has(mode)) {
     throw new DatabaseConfigurationError("Database mode must be auto, postgres, supabase, or sqlite");
@@ -183,13 +183,15 @@ function validateSqlite(value: SqliteProfileConfig | undefined): ValidatedSqlite
   return { profile: "sqlite", engine: "sqlite", filename: value.filename };
 }
 
-function validateNamespace(value: unknown): string {
+/** @internal Shared by the validated factory and direct PostgreSQL Store constructor. */
+export function validateDatabaseNamespace(value: unknown): string {
   if (typeof value !== "string"
     || value.trim().length === 0
+    || value.includes("\0")
     || value.length > 255
     || Buffer.from(value, "utf8").toString("utf8") !== value) {
     throw new DatabaseConfigurationError(
-      "Database namespace must be a non-empty, well-formed Unicode string of at most 255 characters",
+      "Database namespace must be a non-empty, NUL-free, well-formed Unicode string of at most 255 characters",
     );
   }
   return value;
