@@ -3,14 +3,20 @@ import { Pool, type PoolClient, type PoolConfig, type QueryResultRow } from "pg"
 import {
   assertValidSessionId,
   MessageHistoryRewriteRequiredError,
+  resolveSessionOwnershipSave,
+  restoreSessionOwnership,
   SessionAlreadyExistsError,
+  SessionSaveOutcomeUnknownError,
   SessionVersionConflictError,
+  snapshotSessionOwnership,
   type Message,
   type RunState,
   type SaveSessionOptions,
   type Session,
+  type SessionCreateOptions,
   type ToolCallState,
 } from "../session.js";
+import { validateDatabaseNamespace } from "./config.js";
 import { StoreLifecycle } from "./lifecycle.js";
 import { assertPostgresSchema } from "./postgres-migrations.js";
 import { resolvePostgresPoolSsl } from "./postgres-tls.js";
@@ -35,6 +41,7 @@ export interface PostgresSessionStoreOptions {
  * Every checkpoint uses one checked-out client for its complete transaction.
  */
 export class PostgresSessionStore implements ManagedSessionStore {
+  readonly supportsSessionOwnership = true as const;
   readonly profile: "postgres" | "supabase";
   readonly engine = "postgres" as const;
   readonly namespace: string;
@@ -45,7 +52,7 @@ export class PostgresSessionStore implements ManagedSessionStore {
 
   constructor(options: PostgresSessionStoreOptions) {
     this.profile = options.profile ?? "postgres";
-    this.namespace = options.namespace;
+    this.namespace = validateDatabaseNamespace(options.namespace);
     this.pool = options.pool ?? new Pool(createPostgresPoolConfig(options));
     this.idlePoolErrorListener = (error) => {
       try {
@@ -72,20 +79,38 @@ export class PostgresSessionStore implements ManagedSessionStore {
     });
   }
 
-  create(sessionId: string, metadata: Record<string, unknown> = {}): Promise<Session> {
+  create(
+    sessionId: string,
+    metadata: Record<string, unknown> = {},
+    options: SessionCreateOptions = {},
+  ): Promise<Session> {
     return this.lifecycle.run(async () => {
       assertValidSessionId(sessionId);
+      assertPostgresCompatibleValue(metadata);
+      const ownership = snapshotSessionOwnership(options.ownership);
       try {
         await this.pool.query(
-          `INSERT INTO agent_runtime.sessions(namespace, id, version, metadata_json)
-           VALUES ($1, $2, 0, $3::jsonb)`,
-          [this.namespace, sessionId, serializeJson(metadata)],
+          `INSERT INTO agent_runtime.sessions
+           (namespace, id, version, metadata_json, ownership_json)
+           VALUES ($1, $2, 0, $3::jsonb, $4::jsonb)`,
+          [
+            this.namespace,
+            sessionId,
+            serializeJson(metadata),
+            ownership ? serializeJson(ownership) : null,
+          ],
         );
       } catch (error) {
         if (isPostgresError(error, "23505")) throw new SessionAlreadyExistsError(sessionId);
         throw error;
       }
-      return { id: sessionId, version: 0, messages: [], metadata };
+      return {
+        id: sessionId,
+        version: 0,
+        messages: [],
+        metadata,
+        ...(ownership ? { ownership } : {}),
+      };
     });
   }
 
@@ -143,6 +168,7 @@ export class PostgresSessionStore implements ManagedSessionStore {
   }
 
   private async saveCheckpoint(session: Session, options: SaveSessionOptions): Promise<void> {
+    assertPostgresCompatibleValue(session);
     const client = await this.pool.connect();
     const expected = session.version ?? 0;
     const nextVersion = expected + 1;
@@ -154,8 +180,11 @@ export class PostgresSessionStore implements ManagedSessionStore {
     try {
       await client.query("BEGIN");
       transactionStarted = true;
-      const current = await client.query<{ version: string | number }>(
-        `SELECT version FROM agent_runtime.sessions
+      const current = await client.query<{
+        version: string | number;
+        ownership_json: unknown | null;
+      }>(
+        `SELECT version, ownership_json FROM agent_runtime.sessions
          WHERE namespace = $1 AND id = $2 FOR UPDATE`,
         [this.namespace, session.id],
       );
@@ -163,6 +192,12 @@ export class PostgresSessionStore implements ManagedSessionStore {
       if (actual !== expected) {
         throw new SessionVersionConflictError(session.id, expected, actual);
       }
+      const ownership = resolveSessionOwnershipSave(
+        session.id,
+        parseStoredOwnership(current.rows[0]?.ownership_json),
+        session.ownership,
+        options.claimOwnership === true,
+      );
 
       const persistedMessages = options.rewriteMessages
         ? []
@@ -182,14 +217,15 @@ export class PostgresSessionStore implements ManagedSessionStore {
 
       const updated = await client.query(
         `UPDATE agent_runtime.sessions
-         SET version = $3, metadata_json = $4::jsonb, current_run_id = $5,
-             last_checkpoint_id = $6, updated_at = now()
-         WHERE namespace = $1 AND id = $2 AND version = $7`,
+         SET version = $3, metadata_json = $4::jsonb, ownership_json = $5::jsonb,
+             current_run_id = $6, last_checkpoint_id = $7, updated_at = now()
+         WHERE namespace = $1 AND id = $2 AND version = $8`,
         [
           this.namespace,
           session.id,
           nextVersion,
           serializeJson(session.metadata),
+          ownership ? serializeJson(ownership) : null,
           session.runState?.id ?? null,
           checkpointId,
           expected,
@@ -227,8 +263,12 @@ export class PostgresSessionStore implements ManagedSessionStore {
         }
       }
       session.version = nextVersion;
+      restoreSessionOwnership(session, ownership);
     } catch (error) {
-      if (transactionStarted && !commitAttempted) await rollbackPreservingError(client);
+      if (transactionStarted && !commitAttempted) {
+        const rolledBack = await rollbackPreservingError(client);
+        if (!rolledBack) destroyClient = true;
+      }
       throw error;
     } finally {
       if (!clientReleased) client.release(destroyClient);
@@ -262,6 +302,7 @@ export class PostgresSessionStore implements ManagedSessionStore {
     operation: (client: PoolClient) => Promise<Result>,
   ): Promise<Result> {
     const client = await this.pool.connect();
+    let destroyClient = false;
     try {
       await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
       try {
@@ -269,17 +310,17 @@ export class PostgresSessionStore implements ManagedSessionStore {
         await client.query("COMMIT");
         return result;
       } catch (error) {
-        await rollbackPreservingError(client);
+        if (!await rollbackPreservingError(client)) destroyClient = true;
         throw error;
       }
     } finally {
-      client.release();
+      client.release(destroyClient);
     }
   }
 
   private async loadSession(client: PoolClient, sessionId: string): Promise<Session | undefined> {
     const result = await client.query<SessionRow>(
-      `SELECT id, version, metadata_json, current_run_id
+      `SELECT id, version, metadata_json, ownership_json, current_run_id
        FROM agent_runtime.sessions WHERE namespace = $1 AND id = $2`,
       [this.namespace, sessionId],
     );
@@ -289,11 +330,13 @@ export class PostgresSessionStore implements ManagedSessionStore {
     const runState = row.current_run_id
       ? await this.loadRun(client, sessionId, row.current_run_id)
       : undefined;
+    const ownership = parseStoredOwnership(row.ownership_json);
     return {
       id: row.id,
       version: parseVersion(row.version),
       metadata: parseJson<Record<string, unknown>>(row.metadata_json),
       messages,
+      ...(ownership ? { ownership } : {}),
       runState,
     };
   }
@@ -445,7 +488,7 @@ export class PostgresSessionStore implements ManagedSessionStore {
   }
 }
 
-export class PostgresTransactionOutcomeUnknownError extends Error {
+export class PostgresTransactionOutcomeUnknownError extends SessionSaveOutcomeUnknownError {
   readonly sessionId: string;
   readonly checkpointId: string;
 
@@ -481,6 +524,7 @@ interface SessionRow extends QueryResultRow {
   id: string;
   version: string | number;
   metadata_json: unknown;
+  ownership_json: unknown | null;
   current_run_id: string | null;
 }
 
@@ -536,7 +580,7 @@ function sortJson(value: unknown): unknown {
   if (value && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .sort(([left], [right]) => compareJsonKeys(left, right))
         .map(([key, nested]) => [key, sortJson(nested)]),
     );
   }
@@ -554,6 +598,10 @@ function parseJson<Value = unknown>(value: unknown): Value {
   return structuredClone(value) as Value;
 }
 
+function parseStoredOwnership(value: unknown): Session["ownership"] {
+  return value == null ? undefined : snapshotSessionOwnership(parseJson(value));
+}
+
 function parseVersion(value: string | number): number {
   const version = Number(value);
   if (!Number.isSafeInteger(version) || version < 0) {
@@ -566,11 +614,36 @@ function isPostgresError(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && (error as { code?: unknown }).code === code;
 }
 
-async function rollbackPreservingError(client: PoolClient): Promise<void> {
+function compareJsonKeys(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+async function rollbackPreservingError(client: PoolClient): Promise<boolean> {
   try {
     await client.query("ROLLBACK");
+    return true;
   } catch {
     // Preserve the checkpoint error. The connection is released immediately afterwards.
+    return false;
+  }
+}
+
+function assertPostgresCompatibleValue(value: unknown, seen = new WeakSet<object>()): void {
+  if (typeof value === "string") {
+    if (value.includes("\0") || Buffer.from(value, "utf8").toString("utf8") !== value) {
+      throw new PostgresSessionDataError(
+        "PostgreSQL Session values must be NUL-free, well-formed Unicode strings",
+      );
+    }
+    return;
+  }
+  if (typeof value !== "object" || value === null || seen.has(value)) return;
+  seen.add(value);
+  for (const [key, nested] of Object.entries(value)) {
+    assertPostgresCompatibleValue(key, seen);
+    assertPostgresCompatibleValue(nested, seen);
   }
 }
 

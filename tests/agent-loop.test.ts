@@ -2,14 +2,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   AgentLoop,
-  ConversationCompressionTool,
   InMemorySessionStore,
+  SessionSaveOutcomeUnknownError,
   type ModelClient,
   type ModelRequest,
   type ModelResponse,
+  type SaveSessionOptions,
+  type Session,
+  type SessionStore,
+  type Tool,
   ToolRegistry,
   createMessage,
 } from "../src/index.js";
+import { ConversationCompressionTool } from "../src/tools/index.js";
 
 class FakeModel implements ModelClient {
   readonly prompts: string[] = [];
@@ -19,6 +24,56 @@ class FakeModel implements ModelClient {
     const response = this.responses.shift();
     if (!response) throw new Error("No fake response available");
     return response;
+  }
+}
+
+class DurableOutcomeUnknownStore implements SessionStore {
+  readonly error = new SessionSaveOutcomeUnknownError("injected unknown checkpoint outcome");
+  saveCalls = 0;
+  versionAtUnknownSave?: number;
+  private readonly sessions = new Map<string, Session>();
+
+  constructor(private readonly failAt = 2) {}
+
+  async get(sessionId: string): Promise<Session | undefined> {
+    const session = this.sessions.get(sessionId);
+    return session ? structuredClone(session) : undefined;
+  }
+
+  async create(
+    sessionId: string,
+    metadata: Record<string, unknown> = {},
+  ): Promise<Session> {
+    if (this.sessions.has(sessionId)) throw new Error(`Session already exists: ${sessionId}`);
+    const session: Session = { id: sessionId, version: 0, messages: [], metadata };
+    this.sessions.set(sessionId, structuredClone(session));
+    return session;
+  }
+
+  async getOrCreate(sessionId: string): Promise<Session> {
+    return await this.get(sessionId) ?? this.create(sessionId);
+  }
+
+  async save(session: Session, _options?: SaveSessionOptions): Promise<void> {
+    this.saveCalls += 1;
+    const expected = session.version ?? 0;
+    const actual = this.sessions.get(session.id)?.version ?? -1;
+    if (actual !== expected) {
+      throw new Error(`stale Session retry: expected ${expected}, found ${actual}`);
+    }
+
+    const durable = structuredClone(session);
+    durable.version = expected + 1;
+    this.sessions.set(session.id, durable);
+    if (this.saveCalls === this.failAt) {
+      this.versionAtUnknownSave = session.version;
+      throw this.error;
+    }
+    session.version = durable.version;
+  }
+
+  async delete(sessionId: string): Promise<boolean> {
+    return this.sessions.delete(sessionId);
   }
 }
 
@@ -36,6 +91,112 @@ test("runs a turn with external prompt injection", async () => {
   assert.equal(result, "hello");
   assert.match(model.prompts[0]!, /channel instruction/);
   assert.equal((await store.getOrCreate("s1")).messages.length, 2);
+});
+
+test("does not terminal-save a Session after a checkpoint outcome becomes unknown", async () => {
+  const store = new DurableOutcomeUnknownStore();
+  let modelCalls = 0;
+  const loop = new AgentLoop({
+    model: {
+      async complete() {
+        modelCalls += 1;
+        return { content: "must not run" };
+      },
+    },
+    tools: new ToolRegistry(),
+    sessionStore: store,
+    requestApproval: async () => false,
+  });
+
+  await assert.rejects(
+    loop.runTurn({ sessionId: "unknown-checkpoint", userInput: "go" }),
+    (error) => error === store.error,
+  );
+
+  assert.equal(store.saveCalls, 2);
+  assert.equal(store.versionAtUnknownSave, 1);
+  assert.equal(modelCalls, 0);
+  const durable = await store.get("unknown-checkpoint");
+  assert.equal(durable?.version, 2);
+  assert.equal(durable?.runState?.status, "running");
+  assert.equal(durable?.runState?.phase, "model");
+});
+
+test("tool checkpoints fail-stop after a save outcome becomes unknown", async () => {
+  const store = new DurableOutcomeUnknownStore(5);
+  let modelCalls = 0;
+  let toolExecutions = 0;
+  const tools = new ToolRegistry();
+  tools.register({
+    name: "effect",
+    description: "Perform one externally visible effect",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    async execute() {
+      toolExecutions += 1;
+      return { ok: true };
+    },
+  });
+  const loop = new AgentLoop({
+    model: {
+      async complete() {
+        modelCalls += 1;
+        return modelCalls === 1
+          ? { toolCalls: [{ id: "effect-1", name: "effect", arguments: {} }] }
+          : { content: "must not continue" };
+      },
+    },
+    tools,
+    sessionStore: store,
+    requestApproval: async () => false,
+  });
+
+  await assert.rejects(
+    loop.runTurn({ sessionId: "unknown-tool-checkpoint", userInput: "go" }),
+    (error) => error === store.error,
+  );
+
+  assert.equal(store.saveCalls, 5);
+  assert.equal(store.versionAtUnknownSave, 4);
+  assert.equal(modelCalls, 1);
+  assert.equal(toolExecutions, 1);
+  const durable = await store.get("unknown-tool-checkpoint");
+  assert.equal(durable?.version, 5);
+  assert.equal(durable?.runState?.status, "running");
+  assert.equal(durable?.runState?.phase, "tools");
+  assert.equal(durable?.runState?.toolCalls[0]?.status, "completed");
+  assert.deepEqual(durable?.messages.map(({ role }) => role), ["user", "assistant"]);
+});
+
+test("Run policies ignore unrelated non-cloneable Session metadata", async () => {
+  const store = new InMemorySessionStore();
+  const callback = () => "host-only";
+  await store.create("non-cloneable-policy-metadata", { callback });
+  let modelCalls = 0;
+  const loop = new AgentLoop({
+    model: {
+      async complete() {
+        modelCalls += 1;
+        return { content: "done" };
+      },
+    },
+    tools: new ToolRegistry(),
+    sessionStore: store,
+    requestApproval: async () => false,
+  });
+
+  assert.deepEqual(await loop.recoverSession("non-cloneable-policy-metadata"), {
+    recovered: false,
+    interruptedToolCalls: 0,
+  });
+  assert.equal(await loop.runTurn({
+    sessionId: "non-cloneable-policy-metadata",
+    userInput: "go",
+  }), "done");
+
+  assert.equal(modelCalls, 1);
+  const session = await store.get("non-cloneable-policy-metadata");
+  assert.equal(session?.metadata.callback, callback);
+  assert.equal(session?.runState?.status, "completed");
 });
 
 test("performs a tool round trip", async () => {
@@ -366,4 +527,225 @@ test("model requests cannot mutate canonical messages or Tool definitions", asyn
   assert.equal(await loop.runTurn({ sessionId: "provider-isolation", userInput: "original" }), "done");
   assert.equal((await store.get("provider-isolation"))?.messages[0]?.content, "original");
   assert.equal(tools.get("safe").inputSchema.additionalProperties, false);
+});
+
+test("a Turn keeps the Tool snapshot shown to the model after unregister and replacement", async () => {
+  let modelCalls = 0;
+  let originalExecutions = 0;
+  let replacementExecutions = 0;
+  let activeExecutions = 0;
+  let maximumActiveExecutions = 0;
+  const registry = new ToolRegistry();
+  const original: Tool = {
+    name: "lookup",
+    description: "original lookup",
+    executionPolicy: "exclusive",
+    inputSchema: {
+      type: "object",
+      properties: { count: { type: "number" } },
+      required: ["count"],
+      additionalProperties: false,
+    },
+    async execute(input, context) {
+      assert.equal(context.mutableSession, undefined);
+      originalExecutions += 1;
+      activeExecutions += 1;
+      maximumActiveExecutions = Math.max(maximumActiveExecutions, activeExecutions);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      activeExecutions -= 1;
+      return { implementation: "original", count: input.count };
+    },
+  };
+  const replacement: Tool = {
+    name: "lookup",
+    description: "replacement lookup",
+    sessionAccess: "write",
+    inputSchema: {
+      type: "object",
+      properties: { text: { type: "string" } },
+      required: ["text"],
+      additionalProperties: false,
+    },
+    async execute() {
+      replacementExecutions += 1;
+      return { implementation: "replacement" };
+    },
+  };
+  registry.register(original);
+
+  const model: ModelClient = {
+    async complete(request) {
+      modelCalls += 1;
+      if (modelCalls === 1) {
+        assert.deepEqual(request.tools, [{
+          name: "lookup",
+          description: "original lookup",
+          inputSchema: {
+            type: "object",
+            properties: { count: { type: "number" } },
+            required: ["count"],
+            additionalProperties: false,
+          },
+        }]);
+
+        assert.equal(registry.unregister("lookup"), true);
+        original.description = "mutated original";
+        original.inputSchema = { type: "object", additionalProperties: false };
+        original.sessionAccess = "write";
+        original.executionPolicy = "parallel";
+        original.execute = replacement.execute;
+        registry.register(replacement);
+        return {
+          toolCalls: [
+            { id: "lookup-1", name: "lookup", arguments: { count: 1 } },
+            { id: "lookup-2", name: "lookup", arguments: { count: 2 } },
+          ],
+        };
+      }
+      if (modelCalls === 2) {
+        assert.equal(request.tools[0]?.description, "original lookup");
+        assert.deepEqual(request.tools[0]?.inputSchema.properties, {
+          count: { type: "number" },
+        });
+        const results = request.messages
+          .filter((message) => message.role === "tool")
+          .map((message) => JSON.parse(message.content));
+        assert.deepEqual(results, [
+          { implementation: "original", count: 1 },
+          { implementation: "original", count: 2 },
+        ]);
+        return { content: "used original snapshot" };
+      }
+      assert.equal(request.tools[0]?.description, "replacement lookup");
+      assert.deepEqual(request.tools[0]?.inputSchema.properties, {
+        text: { type: "string" },
+      });
+      return { content: "used replacement next Turn" };
+    },
+  };
+  const loop = new AgentLoop({
+    model,
+    tools: registry,
+    sessionStore: new InMemorySessionStore(),
+    requestApproval: async () => false,
+  });
+
+  assert.equal(await loop.runTurn({ sessionId: "tool-snapshot", userInput: "first" }),
+    "used original snapshot");
+  assert.equal(originalExecutions, 2);
+  assert.equal(replacementExecutions, 0);
+  assert.equal(maximumActiveExecutions, 1);
+  assert.equal(await loop.runTurn({ sessionId: "tool-snapshot", userInput: "second" }),
+    "used replacement next Turn");
+});
+
+test("tools registered during a Turn are exposed only to later Turns", async () => {
+  let modelCalls = 0;
+  const registry = new ToolRegistry();
+  registry.register({
+    name: "continue",
+    description: "Continue the current Turn",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    async execute() { return { continued: true }; },
+  });
+  const model: ModelClient = {
+    async complete(request) {
+      modelCalls += 1;
+      if (modelCalls === 1) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["continue"]);
+        registry.register({
+          name: "late",
+          description: "Registered while a Turn is running",
+          inputSchema: { type: "object", properties: {}, additionalProperties: false },
+          async execute() { return null; },
+        });
+        return { toolCalls: [{ id: "continue", name: "continue", arguments: {} }] };
+      }
+      if (modelCalls === 2) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["continue"]);
+        return { content: "first done" };
+      }
+      assert.deepEqual(request.tools.map((tool) => tool.name), ["continue", "late"]);
+      return { content: "second done" };
+    },
+  };
+  const loop = new AgentLoop({
+    model,
+    tools: registry,
+    sessionStore: new InMemorySessionStore(),
+    requestApproval: async () => false,
+  });
+
+  assert.equal(await loop.runTurn({ sessionId: "late-tool", userInput: "first" }), "first done");
+  assert.equal(await loop.runTurn({ sessionId: "late-tool", userInput: "second" }), "second done");
+});
+
+test("direct AgentLoop turns reject duplicate Tool selections before mutation", async () => {
+  let modelCalls = 0;
+  const registry = new ToolRegistry();
+  registry.register({
+    name: "lookup",
+    description: "Lookup",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    async execute() { return null; },
+  });
+  const sessionStore = new InMemorySessionStore();
+  const loop = new AgentLoop({
+    model: {
+      async complete() {
+        modelCalls += 1;
+        return { content: "unused" };
+      },
+    },
+    tools: registry,
+    sessionStore,
+    requestApproval: async () => false,
+  });
+
+  await assert.rejects(
+    loop.runTurnDetailed({
+      sessionId: "duplicate-direct-tools",
+      userInput: "go",
+      tools: ["lookup", "lookup"],
+    }),
+    /Tool already registered: lookup/,
+  );
+  assert.equal(modelCalls, 0);
+  assert.equal(await sessionStore.get("duplicate-direct-tools"), undefined);
+});
+
+test("ToolRegistry snapshots isolate AJV state and failed registration is atomic", () => {
+  const registry = new ToolRegistry();
+  registry.register({
+    name: "existing",
+    description: "Existing",
+    inputSchema: { type: "object", additionalProperties: false },
+    async execute() { return null; },
+  });
+  const snapshot = registry.snapshot();
+  const schemaId = "urn:42-agent:test:snapshot-isolation";
+  snapshot.register({
+    name: "snapshot_only",
+    description: "Snapshot only",
+    inputSchema: { $id: schemaId, type: "object", additionalProperties: false },
+    async execute() { return null; },
+  });
+
+  registry.register({
+    name: "source_only",
+    description: "Source only",
+    inputSchema: { $id: schemaId, type: "object", additionalProperties: false },
+    async execute() { return null; },
+  });
+  assert.equal(registry.has("source_only"), true);
+  assert.equal(snapshot.has("source_only"), false);
+
+  assert.throws(() => registry.register({
+    name: "failed_registration",
+    description: "Must not be partially registered",
+    inputSchema: { $id: schemaId, type: "object", additionalProperties: false },
+    async execute() { return null; },
+  }), /already exists/);
+  assert.equal(registry.has("failed_registration"), false);
+  assert.throws(() => registry.get("failed_registration"), /Unknown tool/);
 });

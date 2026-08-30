@@ -75,6 +75,10 @@ REVOKE ALL ON SCHEMA agent_runtime FROM PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA agent_runtime FROM PUBLIC;
 `;
 
+const SESSION_OWNERSHIP_SQL = `
+ALTER TABLE agent_runtime.sessions ADD COLUMN ownership_json jsonb;
+`;
+
 interface Migration {
   version: number;
   name: string;
@@ -89,6 +93,12 @@ const MIGRATIONS: readonly Migration[] = Object.freeze([
     sql: INITIAL_SCHEMA_SQL,
     checksum: createHash("sha256").update(INITIAL_SCHEMA_SQL).digest("hex"),
   }),
+  Object.freeze({
+    version: 2,
+    name: "protected_session_ownership",
+    sql: SESSION_OWNERSHIP_SQL,
+    checksum: createHash("sha256").update(SESSION_OWNERSHIP_SQL).digest("hex"),
+  }),
 ]);
 
 export class PostgresSchemaMigrationRequiredError extends Error {
@@ -102,6 +112,13 @@ export class PostgresSchemaVersionError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "PostgresSchemaVersionError";
+  }
+}
+
+export class PostgresSchemaPermissionError extends Error {
+  constructor(privileges: readonly string[]) {
+    super(`PostgreSQL Session Store runtime role lacks required privileges: ${privileges.join("; ")}`);
+    this.name = "PostgresSchemaPermissionError";
   }
 }
 
@@ -262,9 +279,6 @@ async function assertSchemaWithClient(client: PoolClient): Promise<void> {
     "SELECT to_regclass('agent_runtime.schema_migrations')::text AS relation",
   );
   if (!migrationTable.rows[0]?.relation) throw new PostgresSchemaMigrationRequiredError();
-  const applied = await loadAppliedMigrations(client);
-  assertKnownMigrations(applied, true);
-
   const requiredTables = ["sessions", "messages", "runs", "tool_calls"];
   const relations = await client.query<{ name: string; relation: string | null }>(
     `SELECT name, to_regclass('agent_runtime.' || name)::text AS relation
@@ -277,6 +291,50 @@ async function assertSchemaWithClient(client: PoolClient): Promise<void> {
       `PostgreSQL Session Store schema is missing tables: ${missing.join(", ")}`,
     );
   }
+  await assertRuntimePrivileges(client);
+  const applied = await loadAppliedMigrations(client);
+  assertKnownMigrations(applied, true);
+}
+
+async function assertRuntimePrivileges(client: PoolClient): Promise<void> {
+  const required = [
+    ["schema_migrations", ["SELECT"]],
+    ["sessions", ["SELECT", "INSERT", "UPDATE", "DELETE"]],
+    ["messages", ["SELECT", "INSERT", "UPDATE", "DELETE"]],
+    ["runs", ["SELECT", "INSERT", "UPDATE", "DELETE"]],
+    ["tool_calls", ["SELECT", "INSERT", "UPDATE", "DELETE"]],
+  ] as const;
+  const checks = required.flatMap(([name, privileges]) => (
+    privileges.map((privilege) => ({ name, privilege }))
+  ));
+  const result = await client.query<{
+    name: string;
+    privilege: string;
+    schema_usage: boolean;
+    allowed: boolean;
+  }>(
+    `WITH required(name, privilege) AS (
+       SELECT * FROM unnest($1::text[], $2::text[])
+     )
+     SELECT required.name, required.privilege,
+            has_schema_privilege(current_user, namespace.oid, 'USAGE') AS schema_usage,
+            has_table_privilege(current_user, relation.oid, required.privilege) AS allowed
+     FROM required
+     JOIN pg_namespace AS namespace ON namespace.nspname = 'agent_runtime'
+     JOIN pg_class AS relation
+       ON relation.relnamespace = namespace.oid AND relation.relname = required.name`,
+    [checks.map(({ name }) => name), checks.map(({ privilege }) => privilege)],
+  );
+  const missing: string[] = [];
+  if (!result.rows[0]?.schema_usage) missing.push("USAGE on schema agent_runtime");
+  const allowed = new Map(
+    result.rows.map((row) => [`${row.name}:${row.privilege}`, row.allowed]),
+  );
+  for (const [name, privileges] of required) {
+    const absent = privileges.filter((privilege) => !allowed.get(`${name}:${privilege}`));
+    if (absent.length > 0) missing.push(`${absent.join(", ")} on agent_runtime.${name}`);
+  }
+  if (missing.length > 0) throw new PostgresSchemaPermissionError(missing);
 }
 
 async function loadAppliedMigrations(client: PoolClient): Promise<Map<number, AppliedMigration>> {

@@ -15,18 +15,59 @@ import {
   type Stream,
 } from "@agentclientprotocol/sdk";
 import {
-  AcpPermissionBridge,
-  AcpUpdateProjector,
   AgentLoop,
   AgentRuntime,
-  createAcpAgent,
   InMemorySessionStore,
   ToolRegistry,
   type ApprovalHandler,
-  type AcpAgentOptions,
   type ModelClient,
+  type SaveSessionOptions,
+  type Session,
+  type SessionCreateOptions,
+  type SessionStore,
+  type SkillCatalog,
   type Tool,
 } from "../src/index.js";
+import {
+  AcpPermissionBridge,
+  AcpUpdateProjector,
+  createAcpAgent,
+  type AcpAgentOptions,
+} from "../src/acp/index.js";
+
+class GatedOwnershipClaimStore implements SessionStore {
+  readonly supportsSessionOwnership = true as const;
+  readonly base = new InMemorySessionStore();
+  readonly claimStarted: Promise<void>;
+  private markClaimStarted!: () => void;
+  private readonly claimGate: Promise<void>;
+  private releaseClaimGate!: () => void;
+
+  constructor() {
+    this.claimStarted = new Promise<void>((resolve) => { this.markClaimStarted = resolve; });
+    this.claimGate = new Promise<void>((resolve) => { this.releaseClaimGate = resolve; });
+  }
+
+  releaseClaim(): void { this.releaseClaimGate(); }
+  get(sessionId: string) { return this.base.get(sessionId); }
+  create(
+    sessionId: string,
+    metadata?: Record<string, unknown>,
+    options?: SessionCreateOptions,
+  ) {
+    return this.base.create(sessionId, metadata, options);
+  }
+  getOrCreate(sessionId: string) { return this.base.getOrCreate(sessionId); }
+  delete(sessionId: string) { return this.base.delete(sessionId); }
+
+  async save(session: Session, options?: SaveSessionOptions): Promise<void> {
+    if (options?.claimOwnership) {
+      this.markClaimStarted();
+      await this.claimGate;
+    }
+    await this.base.save(session, options);
+  }
+}
 
 function createRuntime(
   model: ModelClient,
@@ -139,6 +180,35 @@ test("ACP v1 negotiates honest capabilities and maps session lifecycle", async (
         mcpServers: [],
       }),
       (error: unknown) => error instanceof RequestError && error.code === -32002,
+    );
+  });
+});
+
+test("ACP initialize redacts capability-discovery failures", async () => {
+  const secret = "INIT_SECRET_SENTINEL";
+  const skills: SkillCatalog = {
+    async list() {
+      throw new Error(secret);
+    },
+    async load() {
+      return [];
+    },
+  };
+  const loop = new AgentLoop({
+    model: { async complete() { return { content: "unused" }; } },
+    sessionStore: new InMemorySessionStore(),
+    tools: new ToolRegistry(),
+    skillLoader: skills,
+    requestApproval: async () => false,
+  });
+
+  await client().connectWith(createTestAcpAgent(new AgentRuntime({ loop })), async (context) => {
+    await assert.rejects(
+      initialize(context),
+      (error: unknown) => error instanceof RequestError
+        && error.code === -32603
+        && error.data === undefined
+        && !error.message.includes(secret),
     );
   });
 });
@@ -330,6 +400,42 @@ test("ACP cancel during final update delivery returns cancelled", async (t) => {
   });
 });
 
+test("ACP session/delete terminates a projector after its Runtime Turn has settled", async (t) => {
+  const { runtime, sessionStore } = createRuntime({
+    async complete() { return { content: "done" }; },
+  });
+  const streams = gatedSessionUpdateStreams();
+  t.after(() => streams.releaseDelivery());
+  const agentConnection = createTestAcpAgent(runtime, {
+    updateDeliveryTimeoutMs: 5_000,
+  }).connect(streams.agent);
+  t.after(() => agentConnection.close());
+
+  await client().connectWith(streams.client, async (context) => {
+    await initialize(context);
+    const { sessionId } = await context.request(methods.agent.session.new, {
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+    const prompt = context.request(methods.agent.session.prompt, {
+      sessionId,
+      prompt: [{ type: "text", text: "finish before delivery" }],
+    });
+    await streams.deliveryStarted;
+
+    const deleting = context.request(methods.agent.session.delete, { sessionId });
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (!(await sessionStore.get(sessionId))) break;
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+    }
+    assert.equal(await sessionStore.get(sessionId), undefined);
+    streams.releaseDelivery();
+
+    assert.deepEqual(await deleting, {});
+    assert.deepEqual(await prompt, { stopReason: "cancelled" });
+  });
+});
+
 test("ACP permission bridge uses the client decision for the active tool call", async () => {
   const bridge = new AcpPermissionBridge();
   let approved: boolean | undefined;
@@ -516,7 +622,8 @@ test("ACP rejects unsupported content and ACP-managed MCP servers precisely", as
       }),
       (error: unknown) => error instanceof RequestError
         && error.code === -32602
-        && /configured workspace root/.test(error.message),
+        && /configured workspace root/.test(error.message)
+        && !JSON.stringify(error.data).includes(process.cwd()),
     );
     await assert.rejects(
       context.request(methods.agent.session.prompt, {
@@ -546,7 +653,7 @@ test("ACP accepts a symlink alias for the configured canonical workspace", async
       cwd: alias,
       mcpServers: [],
     });
-    assert.equal((await runtime.getSession(sessionId))?.metadata["acp.cwd"], await realpath(workspace));
+    assert.equal((await runtime.getSession(sessionId))?.metadata["acp.cwd"], undefined);
     assert.deepEqual(await context.request(methods.agent.session.resume, {
       sessionId,
       cwd: alias,
@@ -555,12 +662,321 @@ test("ACP accepts a symlink alias for the configured canonical workspace", async
   });
 });
 
-test("ACP cannot resume, prompt, or delete a foreign unbound Session", async () => {
+test("ACP migrates quarantined cwd Sessions only through a trusted host allowlist", async () => {
+  let modelCalls = 0;
+  const { runtime, sessionStore } = createRuntime({
+    async complete() {
+      modelCalls += 1;
+      return { content: "restored" };
+    },
+  });
+  const workspace = await realpath(process.cwd());
+  const binding = { kind: "acp.workspace", value: workspace };
+  await sessionStore.create("legacy-approved", { "acp.cwd": workspace, keep: true });
+  await sessionStore.create("legacy-denied", { "acp.cwd": workspace });
+  await sessionStore.create("legacy-bare-binding", {
+    "acp.cwd": workspace,
+    "runtime.binding": binding,
+  });
+  await sessionStore.create("forged-versioned-binding", {
+    "runtime.binding": { version: 1, ...binding },
+  });
+
+  // Migration is disabled by default even when the legacy marker matches cwd.
+  await client().connectWith(createTestAcpAgent(runtime), async (context) => {
+    await initialize(context);
+    await assert.rejects(
+      context.request(methods.agent.session.resume, {
+        sessionId: "legacy-approved",
+        cwd: process.cwd(),
+        mcpServers: [],
+      }),
+      (error: unknown) => error instanceof RequestError && error.code === -32002,
+    );
+  });
+
+  const authorizationCalls: string[] = [];
+  const agent = createTestAcpAgent(runtime, {
+    authorizeLegacySessionMigration(request) {
+      assert.equal(Object.isFrozen(request), true);
+      assert.equal(request.workspaceRoot, workspace);
+      assert.equal(request.signal.aborted, false);
+      authorizationCalls.push(request.sessionId);
+      return request.sessionId === "legacy-approved";
+    },
+  });
+  await client().connectWith(agent, async (context) => {
+    await initialize(context);
+    assert.deepEqual(await context.request(methods.agent.session.resume, {
+      sessionId: "legacy-approved",
+      cwd: process.cwd(),
+      mcpServers: [],
+    }), {});
+    assert.deepEqual(await context.request(methods.agent.session.prompt, {
+      sessionId: "legacy-approved",
+      prompt: [{ type: "text", text: "continue old Session" }],
+    }), { stopReason: "end_turn" });
+
+    for (const sessionId of ["legacy-denied", "legacy-bare-binding"]) {
+      await assert.rejects(
+        context.request(methods.agent.session.resume, {
+          sessionId,
+          cwd: process.cwd(),
+          mcpServers: [],
+        }),
+        (error: unknown) => error instanceof RequestError && error.code === -32002,
+      );
+    }
+    await assert.rejects(
+      context.request(methods.agent.session.resume, {
+        sessionId: "forged-versioned-binding",
+        cwd: process.cwd(),
+        mcpServers: [],
+      }),
+      (error: unknown) => error instanceof RequestError && error.code === -32002,
+    );
+    await assert.rejects(
+      context.request(methods.agent.session.prompt, {
+        sessionId: "forged-versioned-binding",
+        prompt: [{ type: "text", text: "must remain quarantined" }],
+      }),
+      (error: unknown) => error instanceof RequestError && error.code === -32002,
+    );
+    assert.deepEqual(
+      await context.request(methods.agent.session.delete, { sessionId: "legacy-denied" }),
+      {},
+    );
+  });
+
+  assert.equal(modelCalls, 1);
+  assert.deepEqual(authorizationCalls, ["legacy-approved", "legacy-denied"]);
+  const approved = await sessionStore.get("legacy-approved");
+  assert.equal(approved?.metadata["acp.cwd"], undefined);
+  assert.equal(approved?.metadata["runtime.binding"], undefined);
+  assert.deepEqual(approved?.ownership, { version: 1, ...binding });
+  assert.ok(await sessionStore.get("legacy-denied"));
+  assert.deepEqual(
+    (await sessionStore.get("legacy-bare-binding"))?.metadata["runtime.binding"],
+    binding,
+  );
+  await assert.rejects(
+    runtime.resumeSession("legacy-approved"),
+    { name: "SessionBindingMismatchError" },
+  );
+});
+
+test("ACP requires literal true from legacy authorization and redacts callback errors", async () => {
+  const { runtime, sessionStore } = createRuntime({
+    async complete() { return { content: "unused" }; },
+  });
+  const workspace = await realpath(process.cwd());
+  await sessionStore.create("legacy-truthy", { "acp.cwd": workspace });
+  await sessionStore.create("legacy-callback-error", { "acp.cwd": workspace });
+  const secret = "HOST_CALLBACK_SECRET";
+  const agent = createTestAcpAgent(runtime, {
+    authorizeLegacySessionMigration({ sessionId }) {
+      if (sessionId === "legacy-truthy") return "yes" as unknown as boolean;
+      throw RequestError.invalidParams({ secret }, secret);
+    },
+  });
+
+  await client().connectWith(agent, async (context) => {
+    await initialize(context);
+    await assert.rejects(
+      context.request(methods.agent.session.resume, {
+        sessionId: "legacy-truthy",
+        cwd: process.cwd(),
+        mcpServers: [],
+      }),
+      (error: unknown) => error instanceof RequestError && error.code === -32002,
+    );
+    await assert.rejects(
+      context.request(methods.agent.session.resume, {
+        sessionId: "legacy-callback-error",
+        cwd: process.cwd(),
+        mcpServers: [],
+      }),
+      (error: unknown) => error instanceof RequestError
+        && error.code === -32603
+        && error.data === undefined
+        && !error.message.includes(secret),
+    );
+  });
+  assert.equal((await sessionStore.get("legacy-truthy"))?.metadata["runtime.binding"], undefined);
+  assert.equal(
+    (await sessionStore.get("legacy-callback-error"))?.metadata["runtime.binding"],
+    undefined,
+  );
+});
+
+test("ACP delete aborts and outwaits pending legacy authorization without late migration", async () => {
+  const { runtime, sessionStore } = createRuntime({
+    async complete() { return { content: "unused" }; },
+  });
+  const workspace = await realpath(process.cwd());
+  await sessionStore.create("legacy-delete-race", { "acp.cwd": workspace });
+  let markAuthorizationStarted!: () => void;
+  const authorizationStarted = new Promise<void>((resolve) => {
+    markAuthorizationStarted = resolve;
+  });
+  let releaseAuthorization!: () => void;
+  const authorization = new Promise<boolean>((resolve) => {
+    releaseAuthorization = () => resolve(true);
+  });
+  let authorizationSignal: AbortSignal | undefined;
+  const connection = client().connect(createTestAcpAgent(runtime, {
+    authorizeLegacySessionMigration(request) {
+      authorizationSignal = request.signal;
+      markAuthorizationStarted();
+      // Deliberately ignore the signal. The adapter's abort race must still
+      // let delete cross the authorization barrier without a late migration.
+      return authorization;
+    },
+  }));
+
+  try {
+    await initialize(connection.agent);
+    const resuming = connection.agent.request(methods.agent.session.resume, {
+      sessionId: "legacy-delete-race",
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+    const resumeRejected = assert.rejects(
+      resuming,
+      (error: unknown) => error instanceof RequestError && error.code === -32800,
+    );
+    await authorizationStarted;
+
+    assert.deepEqual(await connection.agent.request(methods.agent.session.delete, {
+      sessionId: "legacy-delete-race",
+    }), {});
+    await resumeRejected;
+    assert.equal(authorizationSignal?.aborted, true);
+
+    releaseAuthorization();
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    const stored = await sessionStore.get("legacy-delete-race");
+    assert.deepEqual(stored?.metadata["acp.cwd"], workspace);
+    assert.equal(stored?.metadata["runtime.binding"], undefined);
+    assert.equal(stored?.ownership, undefined);
+  } finally {
+    releaseAuthorization();
+    connection.close();
+    await connection.closed;
+  }
+});
+
+test("ACP delete holds admission while a legacy ownership claim is beyond the barrier", async () => {
+  const sessionStore = new GatedOwnershipClaimStore();
+  const loop = new AgentLoop({
+    model: { async complete() { return { content: "must not run" }; } },
+    sessionStore,
+    tools: new ToolRegistry(),
+    requestApproval: async () => false,
+  });
+  const runtime = new AgentRuntime({ loop });
+  const workspace = await realpath(process.cwd());
+  await sessionStore.create("legacy-claim-delete-race", { "acp.cwd": workspace });
+  let markResumeAborted!: () => void;
+  const resumeAborted = new Promise<void>((resolve) => { markResumeAborted = resolve; });
+  const connection = client().connect(createTestAcpAgent(runtime, {
+    authorizeLegacySessionMigration({ signal }) {
+      signal.addEventListener("abort", markResumeAborted, { once: true });
+      return true;
+    },
+  }));
+
+  try {
+    await initialize(connection.agent);
+    const resuming = connection.agent.request(methods.agent.session.resume, {
+      sessionId: "legacy-claim-delete-race",
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+    const resumeRejected = assert.rejects(
+      resuming,
+      (error: unknown) => error instanceof RequestError && error.code === -32800,
+    );
+    await sessionStore.claimStarted;
+
+    let deleteSettled = false;
+    const deleting = connection.agent.request(methods.agent.session.delete, {
+      sessionId: "legacy-claim-delete-race",
+    }).then((result) => {
+      deleteSettled = true;
+      return result;
+    });
+    await resumeAborted;
+    assert.equal(deleteSettled, false);
+    await assert.rejects(
+      connection.agent.request(methods.agent.session.prompt, {
+        sessionId: "legacy-claim-delete-race",
+        prompt: [{ type: "text", text: "must not enter during delete" }],
+      }),
+      (error: unknown) => error instanceof RequestError && error.code === -32600,
+    );
+
+    sessionStore.releaseClaim();
+    assert.deepEqual(await deleting, {});
+    await resumeRejected;
+    assert.equal(await sessionStore.get("legacy-claim-delete-race"), undefined);
+  } finally {
+    sessionStore.releaseClaim();
+    connection.close();
+    await connection.closed;
+  }
+});
+
+test("ACP connection close aborts pending legacy authorization without late migration", async () => {
+  const { runtime, sessionStore } = createRuntime({
+    async complete() { return { content: "unused" }; },
+  });
+  const workspace = await realpath(process.cwd());
+  await sessionStore.create("legacy-disconnect-race", { "acp.cwd": workspace });
+  let markAuthorizationStarted!: () => void;
+  const authorizationStarted = new Promise<void>((resolve) => {
+    markAuthorizationStarted = resolve;
+  });
+  let releaseAuthorization!: () => void;
+  const authorization = new Promise<boolean>((resolve) => {
+    releaseAuthorization = () => resolve(true);
+  });
+  let authorizationSignal: AbortSignal | undefined;
+  const connection = client().connect(createTestAcpAgent(runtime, {
+    authorizeLegacySessionMigration(request) {
+      authorizationSignal = request.signal;
+      markAuthorizationStarted();
+      return authorization;
+    },
+  }));
+
+  await initialize(connection.agent);
+  const resuming = connection.agent.request(methods.agent.session.resume, {
+    sessionId: "legacy-disconnect-race",
+    cwd: process.cwd(),
+    mcpServers: [],
+  });
+  const resumeRejected = assert.rejects(resuming);
+  await authorizationStarted;
+  connection.close();
+  await connection.closed;
+  await resumeRejected;
+  assert.equal(authorizationSignal?.aborted, true);
+
+  releaseAuthorization();
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  const stored = await sessionStore.get("legacy-disconnect-race");
+  assert.deepEqual(stored?.metadata["acp.cwd"], workspace);
+  assert.equal(stored?.metadata["runtime.binding"], undefined);
+  assert.equal(stored?.ownership, undefined);
+});
+
+test("ACP cannot be tricked into adopting a foreign Session through generic metadata", async () => {
   const { runtime } = createRuntime({ async complete() { return { content: "unused" }; } });
-  const sensitiveForeignRoot = "/private/tenant-secret/workspace";
+  const forgedWorkspace = await realpath(process.cwd());
   await runtime.createSession({
     sessionId: "foreign-session",
-    metadata: { "acp.cwd": sensitiveForeignRoot },
+    metadata: { "acp.cwd": forgedWorkspace },
   });
 
   await client().connectWith(createTestAcpAgent(runtime), async (context) => {
@@ -573,7 +989,7 @@ test("ACP cannot resume, prompt, or delete a foreign unbound Session", async () 
       }),
       (error: unknown) => error instanceof RequestError
         && error.code === -32002
-        && !JSON.stringify(error).includes(sensitiveForeignRoot),
+        && !JSON.stringify(error).includes(forgedWorkspace),
     );
     await assert.rejects(
       context.request(methods.agent.session.prompt, {
@@ -582,9 +998,9 @@ test("ACP cannot resume, prompt, or delete a foreign unbound Session", async () 
       }),
       (error: unknown) => error instanceof RequestError && error.code === -32002,
     );
-    await assert.rejects(
-      context.request(methods.agent.session.delete, { sessionId: "foreign-session" }),
-      (error: unknown) => error instanceof RequestError && error.code === -32002,
+    assert.deepEqual(
+      await context.request(methods.agent.session.delete, { sessionId: "foreign-session" }),
+      {},
     );
   });
   assert.ok(await runtime.getSession("foreign-session"));
@@ -647,7 +1063,8 @@ test("ACP bounds pending session updates and cancels on backpressure", async () 
       }),
       (error: unknown) => error instanceof RequestError
         && error.code === -32603
-        && /queue exceeded/.test(JSON.stringify(error.data)),
+        && error.data === undefined
+        && /agent runtime request failed/.test(error.message),
     );
     assert.equal((await sessionStore.get(sessionId))?.runState?.status, "cancelled");
   });
@@ -761,6 +1178,37 @@ test("ACP projector cancellation releases a hung transport delivery", async () =
   await projector.drain();
   assert.equal(projector.failure, undefined);
   assert.equal(deliveries, 1);
+});
+
+test("ACP projector redacts Tool failure details", async () => {
+  const delivered: unknown[] = [];
+  const controller = new AbortController();
+  const projector = new AcpUpdateProjector({
+    sessionId: "redacted-tool-failure",
+    client: {
+      notify(_method: unknown, params: unknown) {
+        delivered.push(params);
+        return Promise.resolve();
+      },
+    } as unknown as AgentContext,
+    maxPendingUpdates: 2,
+    signal: controller.signal,
+    deliveryTimeoutMs: 1_000,
+    onFailure: (error) => controller.abort(error),
+  });
+
+  projector.observe({
+    type: "tool_call_failed",
+    sessionId: "redacted-tool-failure",
+    runId: "run-redacted",
+    call: { id: "call-redacted", name: "private_tool", arguments: {} },
+    error: "postgresql://admin:secret@internal.invalid/database",
+  });
+  await projector.drain();
+
+  const wire = JSON.stringify(delivered);
+  assert.doesNotMatch(wire, /admin|secret|internal\.invalid/);
+  assert.match(wire, /Tool call failed/);
 });
 
 test("ACP permission bridge defaults to deny outside an ACP prompt", async () => {

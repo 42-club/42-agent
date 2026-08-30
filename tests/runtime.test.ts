@@ -1,19 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  AdaptedModelClient,
   AgentLoop,
-  ConversationCompressionTool,
   InMemorySessionStore,
-  ModelRunner,
   type ModelClient,
   type ModelRequest,
   type ModelResponse,
   type ModelStreamEvent,
-  RetryPolicy,
   ToolRegistry,
   createMessage,
 } from "../src/index.js";
+import { AdaptedModelClient } from "../src/provider/index.js";
+import { ModelRunner } from "../src/runtime/model-runner.js";
+import { RetryPolicy } from "../src/runtime/retry.js";
+import { ConversationCompressionTool } from "../src/tools/index.js";
 
 function createLoop(model: ModelClient, store = new InMemorySessionStore()): AgentLoop {
   const tools = new ToolRegistry();

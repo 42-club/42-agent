@@ -1,6 +1,6 @@
 import type { AgentLoopEvent } from "../runtime/events.js";
 import type { RuntimeStopReason } from "../agent-runtime.js";
-import type { TurnRequest } from "../service/runtime-http-server.js";
+import type { TurnRequest } from "./runtime-http-server.js";
 
 export type RuntimeStreamItem =
   | { type: "event"; event: AgentLoopEvent }
@@ -11,7 +11,7 @@ export type RuntimeStreamItem =
     stopReason: RuntimeStopReason;
     content: string;
   }
-  | { type: "error"; message: string };
+  | { type: "error"; code: string; message: string };
 
 export async function* streamRuntimeTurn(
   baseUrl: string,
@@ -24,9 +24,12 @@ export async function* streamRuntimeTurn(
     body: JSON.stringify(request),
     signal,
   });
-  if (!response.ok || !response.body) {
-    await response.body?.cancel().catch(() => undefined);
-    throw new Error(`Runtime request failed: ${response.status}`);
+  if (!response.ok) {
+    yield await readRuntimeHttpError(response);
+    return;
+  }
+  if (!response.body) {
+    throw new Error(`Runtime response body is missing: ${response.status}`);
   }
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";
@@ -48,4 +51,24 @@ export async function* streamRuntimeTurn(
     if (!completed) await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
+}
+
+async function readRuntimeHttpError(response: Response): Promise<RuntimeStreamItem> {
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (cause) {
+    throw new Error(`Runtime request failed: ${response.status}`, { cause });
+  }
+  if (!isRecord(payload)
+    || payload.type !== "error"
+    || typeof payload.code !== "string"
+    || typeof payload.message !== "string") {
+    throw new Error(`Runtime request failed: ${response.status}`);
+  }
+  return { type: "error", code: payload.code, message: payload.message };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -1,10 +1,11 @@
 import { SqliteSessionStore } from "../session-sqlite.js";
-import type { SaveSessionOptions, Session } from "../session.js";
+import type { SaveSessionOptions, Session, SessionCreateOptions } from "../session.js";
 import { StoreLifecycle } from "./lifecycle.js";
 import type { ManagedSessionStore } from "./types.js";
 
 /** Managed adapter for the existing single-process SQLite Store. */
 export class ManagedSqliteSessionStore implements ManagedSessionStore {
+  readonly supportsSessionOwnership = true as const;
   readonly profile = "sqlite" as const;
   readonly engine = "sqlite" as const;
   readonly namespace: string;
@@ -27,8 +28,12 @@ export class ManagedSqliteSessionStore implements ManagedSessionStore {
     return this.lifecycle.run(async () => this.store.get(sessionId));
   }
 
-  create(sessionId: string, metadata?: Record<string, unknown>): Promise<Session> {
-    return this.lifecycle.run(async () => this.store.create(sessionId, metadata));
+  create(
+    sessionId: string,
+    metadata?: Record<string, unknown>,
+    options?: SessionCreateOptions,
+  ): Promise<Session> {
+    return this.lifecycle.run(async () => this.store.create(sessionId, metadata, options));
   }
 
   getOrCreate(sessionId: string): Promise<Session> {

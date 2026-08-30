@@ -83,10 +83,10 @@ export class AcpUpdateProjector {
           sessionUpdate: "tool_call_update",
           toolCallId: event.call.id,
           status: "failed",
-          rawOutput: { error: event.error },
+          rawOutput: { error: "Tool call failed" },
           content: [{
             type: "content",
-            content: { type: "text", text: event.error },
+            content: { type: "text", text: "Tool call failed" },
           }],
         });
         break;

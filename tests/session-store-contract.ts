@@ -141,7 +141,7 @@ export function defineSessionStoreContract(adapter: SessionStoreContractAdapter)
 
   test(`${adapter.name} SessionStore: preserves valid Unicode and rejects ill-formed IDs`, async () => {
     await withFixture(adapter, async (fixture) => {
-      for (const invalidId of ["", "\ud800", "\udfff"]) {
+      for (const invalidId of ["", "\0", "\ud800", "\udfff"]) {
         await assert.rejects(fixture.store.create(invalidId), { name: "InvalidSessionIdError" });
         await assert.rejects(fixture.store.get(invalidId), { name: "InvalidSessionIdError" });
         await assert.rejects(fixture.store.getOrCreate(invalidId), {
@@ -160,6 +160,65 @@ export function defineSessionStoreContract(adapter: SessionStoreContractAdapter)
       assert.equal(restored?.id, sessionId);
       assert.equal(restored?.metadata.label, "多语言 🧪");
       assert.equal(restored?.messages[0]?.content, "こんにちは — Здравствуйте");
+    });
+  });
+
+  test(`${adapter.name} SessionStore: protects atomic ownership independently of metadata`, async () => {
+    await withFixture(adapter, async (fixture) => {
+      const store = fixture.store;
+      assert.equal(store.supportsSessionOwnership, true);
+      const legacyEnvelope = { version: 1, kind: "adapter", value: "legacy-owner" };
+      const legacy = await store.create("legacy-ownership-metadata", {
+        "runtime.binding": legacyEnvelope,
+      });
+      assert.equal(legacy.ownership, undefined);
+
+      await assert.rejects(
+        store.create("invalid-atomic-owner", {}, {
+          ownership: {
+            version: 1,
+            kind: "adapter",
+            value: "owner",
+            unexpected: true,
+          } as never,
+        }),
+        { name: "InvalidSessionOwnershipError" },
+      );
+      assert.equal(await store.get("invalid-atomic-owner"), undefined);
+
+      const requested = { version: 1 as const, kind: "adapter", value: "owner-a" };
+      const owned = await store.create("atomically-owned", {}, { ownership: requested });
+      assert.deepEqual(owned.ownership, requested);
+      requested.value = "caller-mutated";
+      owned.ownership!.value = "live-mutated";
+      assert.deepEqual((await store.get(owned.id))?.ownership, {
+        version: 1,
+        kind: "adapter",
+        value: "owner-a",
+      });
+
+      owned.ownership = { version: 1, kind: "adapter", value: "owner-b" };
+      await assert.rejects(store.save(owned), { name: "SessionOwnershipConflictError" });
+      assert.equal((await store.get(owned.id))?.ownership?.value, "owner-a");
+
+      const claim = await store.create("claim-once");
+      claim.ownership = { version: 1, kind: "adapter", value: "claimed-owner" };
+      await store.save(claim, { claimOwnership: true });
+      assert.equal(claim.version, 1);
+      await assert.rejects(store.save(claim, { claimOwnership: true }), {
+        name: "SessionOwnershipConflictError",
+      });
+      await store.save(claim);
+      assert.equal(claim.version, 2);
+
+      const reopened = await fixture.reopen();
+      assert.equal((await reopened.get(legacy.id))?.ownership, undefined);
+      assert.equal((await reopened.get(owned.id))?.ownership?.value, "owner-a");
+      assert.deepEqual((await reopened.get(claim.id))?.ownership, {
+        version: 1,
+        kind: "adapter",
+        value: "claimed-owner",
+      });
     });
   });
 

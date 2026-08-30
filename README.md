@@ -60,10 +60,30 @@ text markers. `name`, `title`, and `version` configure the identity returned by 
 
 The required `workspaceRoot` is the canonical root already enforced by the host's tools or sandbox. ACP
 session `cwd` must resolve to that same directory; this adapter does not dynamically reconfigure tool
-roots. Resume, prompt, and delete also require the Session's stored `acp.cwd` to match; missing or foreign
-workspace metadata is rejected without exposing whether an existing Session is foreign. Resume and prompt
-reject a nonexistent Session, while delete remains idempotent. `session/cancel` affects only a prompt
-admitted by this adapter. To bridge Runtime approvals to the active ACP client, use the same `AcpPermissionBridge` when
+roots. New ACP Sessions receive a protected Runtime binding to that root; generic Session metadata cannot
+set or replace it. Resume, prompt, cancel, and delete atomically require the same binding, so a forged
+metadata key or a delete/recreate race cannot cross adapter ownership. Missing or foreign bindings are
+rejected without exposing whether an existing Session is foreign. Resume and prompt reject a nonexistent
+Session, while delete remains idempotent. `session/cancel` affects only a prompt admitted by this adapter.
+
+The binding is an exact versioned envelope (`{ version: 1, kind, value }`) persisted through a
+Store-protected top-level field (and an independent column in database Stores). The trust boundary is that
+protected Store capability and write path, not the JSON shape: every `runtime.binding` value in generic
+metadata is quarantined rather than promoted. Sessions created by the previous ACP adapter carry only
+`acp.cwd`; that key was also generic metadata and is insufficient proof of ownership. Both legacy forms are
+hidden from unbound channels as missing Sessions, and current generic metadata strips both reserved keys.
+The File Store likewise ignores `ownership` found in an older raw Session JSON file; only its new
+magic-framed container carries protected provenance.
+Custom Session Stores must explicitly implement the protected atomic create/claim contract before Runtime
+bindings can be used. To retain a known pre-upgrade ACP Session, supply
+`authorizeLegacySessionMigration` with a trusted Session-ID allowlist or equivalent external inventory.
+Approval must not be based only on the stored `acp.cwd` or requested workspace. After approval, the Runtime
+re-checks the exact marker inside the per-Session FIFO, removes it, and performs one versioned save. An
+outcome-unknown save is returned to the host without retry; reload the Session to learn whether the binding
+became durable. The callback receives an `AbortSignal`; delete and disconnect cancel and join pending
+authorization, while delete blocks new resume/prompt admission for that Session.
+
+To bridge Runtime approvals to the active ACP client, use the same `AcpPermissionBridge` when
 constructing both `AgentLoop` and the adapter. The snippet assumes `model`, `tools`, and `sessionStore`
 have been configured as in [`examples/minimal.ts`](./examples/minimal.ts):
 
@@ -81,7 +101,6 @@ const loop = new AgentLoop({
   requestApproval: permissions.requestApproval,
 });
 const runtime = new AgentRuntime({ loop });
-await runtime.start();
 
 const app = createAcpAgent(runtime, {
   workspaceRoot: process.cwd(), // Must match the host tool/sandbox root.
@@ -138,6 +157,7 @@ channel C ─┘
 - protocol-neutral `AgentRuntime` lifecycle for sessions, prompts, cancellation, steering, and capabilities
 - one canonical `SessionStore`, `ToolRegistry`, and Skill loader, derived from `AgentLoop` and checked at Runtime construction
 - runtime, session, and turn-level Tool/Skill selection without injecting implementations through prompts
+- protected protocol bindings plus immutable per-Turn Tool and Skill snapshots
 - runtime-isolated, deeply immutable Session snapshots for read-only tools
 - bounded parallel execution for explicitly parallel tools and exclusive execution for ordered side effects or trusted write tools
 - canonical server-side messages and run state, isolated from Model, Tool-argument, event, and Runtime DTO snapshots
@@ -152,7 +172,7 @@ channel C ─┘
 - managed database startup selection with PostgreSQL > Supabase > SQLite priority and no failure fallback
 - pure model-request, recovery, and finalization policy plans applied and checkpointed only by `AgentLoop`
 - per-session FIFO turns and recovery while different sessions remain concurrent
-- well-formed Unicode Session IDs with collision-checked, fixed-length File Store paths
+- non-empty, NUL-free, well-formed Unicode Session IDs with collision-checked, fixed-length File Store paths
 
 ## Architecture
 
@@ -162,8 +182,9 @@ of truth.
 `AgentLoop` owns the per-session FIFO coordinator and remains the only core mutation coordinator.
 `ModelRequestPlanner`, `RunRecovery`, and `RunFinalizer` only return plans; the Loop applies them, saves the
 result, and orders events. Its internal coordinated Tool executor receives only a private per-Run mutation
-gate, which serializes admitted mutations with their checkpoints. The exported `ToolExecutor` retains its
-old direct-construction API as a deprecated compatibility facade and is not used by `AgentLoop`.
+gate, which serializes admitted mutations with their checkpoints. The deprecated `ToolExecutor` retains
+its old direct-construction API only from `42-agent/legacy`; it is not used by `AgentLoop` and is not part
+of the stable core surface.
 `SessionStore` is the persistence boundary.
 Channels normalize transport input and project best-effort events; providers normalize model APIs; tools
 execute capabilities. See
@@ -192,8 +213,25 @@ npm run check
 functions across `dist/src`. GitHub Actions runs lint, type-checking, coverage gates, and
 `npm pack --dry-run` on Node.js 22.13, 24, and 26.
 
-The package exposes `dist/src/index.js` and its declarations, plus `42-agent/acp` for the ACP adapter and
-`42-agent/storage` for managed database Stores.
+The package root exports only the protocol-neutral core: `AgentLoop`, `AgentRuntime`, canonical model and
+Session contracts, Skills, and `ToolRegistry`. Integrations use explicit public subpaths:
+
+- `42-agent/acp`: ACP adapter
+- `42-agent/channel`: Channel Runtime, HTTP server/client, and Channel contracts
+- `42-agent/provider`: Provider adapters, including OpenRouter and AI SDK adapters
+- `42-agent/storage`: File, SQLite, PostgreSQL/Supabase, and managed Store lifecycle
+- `42-agent/tools`: Tool contracts, Bash, and conversation compression
+- `42-agent/mcp`: MCP tool adaptation and lifecycle
+- `42-agent/legacy`: deprecated `ToolExecutor` compatibility API only
+
+Importing `42-agent` no longer evaluates ACP, provider, Channel, PostgreSQL, or other optional adapter
+barrels. Imports of those symbols from the package root, including `ToolExecutor`, are breaking changes;
+move them to the corresponding subpath. Internal `src/runtime/*` policy objects are not package exports.
+This release also removes the no-op `AgentRuntime.start()` method: use a constructed Runtime immediately.
+`RuntimeStopReason` is now only `"end_turn"`; cancellation and failure reject `prompt()` and must be handled
+as errors (ACP maps cancellation to its own protocol stop reason). Finally, `SessionInfo.skills` and
+`SessionInfo.tools` are now the explicit `CapabilityScope` union—branch on `mode` before reading `names`
+instead of treating either field as an array.
 It is licensed under [Apache-2.0](./LICENSE) and configured for public npm publication. Public releases
 use semantic versions and remain an explicit maintainer action; `npm pack --dry-run` verifies package
 contents without publishing them.
@@ -245,20 +283,23 @@ it](https://supabase.com/docs/guides/database/connecting-to-postgres). PostgreSQ
 the private `agent_runtime` schema and are keyed by `(namespace, session ID)`; the application must ensure
 that no two processes own the same pair concurrently.
 
-For each Supabase `databaseUrl` and `migrationUrl`, TLS defaults to `ssl: true` when that URL contains no
-PostgreSQL TLS parameter (`ssl`, `sslmode`, `sslcert`, `sslkey`, `sslrootcert`, or `sslnegotiation`). If a
-URL contains one of those parameters, the library leaves TLS parsing to `pg` for that connection. An
-explicit profile-level `ssl` setting cannot be combined with TLS parameters in either URL. Set
-`ssl: false` only for an intentionally plaintext local or self-hosted database; never disable TLS for
-hosted Supabase. The safe resolution diagnostic includes `ssl` when the library selected it and omits the
-field when the URL controls TLS.
+For each Supabase `databaseUrl` and `migrationUrl`, TLS defaults to `ssl: true` unless that URL contains an
+option that actually configures SSL (`ssl`, `sslmode`, `sslcert`, `sslkey`, `sslrootcert`, or
+`sslnegotiation=direct`). `sslnegotiation=postgres` changes only the handshake, so by itself it retains the
+secure profile default. Empty, repeated, or unknown negotiation parameters are rejected rather than being
+allowed to suppress TLS accidentally. When the URL configures SSL, the library leaves its effective value
+to `pg`; an explicit profile-level `ssl` setting cannot be combined with those URL options. Set `ssl: false`
+only for an intentionally plaintext local or self-hosted database; never disable TLS for hosted Supabase.
+The safe resolution diagnostic includes `ssl` when the library selected it and omits the field when the URL
+controls TLS.
 
 PostgreSQL-backed startup defaults to `schemaMode: "check"`. Apply DDL explicitly in a deployment step
 with `migratePostgresSchema(...)`, or opt a profile into `schemaMode: "migrate"`; an optional
 `migrationConnectionString`/`migrationUrl` can keep elevated migration credentials separate from runtime
 credentials. Put that explicit invocation in the deployment pipeline; Supabase documents its [database
 migration workflow](https://supabase.com/docs/guides/deployment/database-migrations). `openSessionStore`
-performs its readiness check before returning.
+performs its readiness check before returning, including migration integrity and every documented runtime
+schema/table privilege.
 
 The standalone migration API is profile-aware, so Supabase retains the same secure TLS default:
 
@@ -316,8 +357,9 @@ and signal-safe shutdown order are in [`examples/runtime-server.ts`](./examples/
 The HTTP server is a trusted development adapter, not a production ingress: it has no authentication,
 binds to loopback by default, rejects browser origins unless an exact `allowedOrigin` is configured,
 requires JSON request bodies, bounds request and queued event bytes, and does not register the optional
-Bash tool. Put authentication, Host/DNS-rebinding defense, tenancy, rate limits, and deployment policy in
-the embedding application.
+Bash tool. It returns typed 4xx admission failures, keeps internal failures generic, and redacts internal
+error messages/codes from streamed events. Put authentication, Host/DNS-rebinding defense, tenancy, rate
+limits, and deployment policy in the embedding application.
 
 Then use the CLI with an explicit session ID:
 
@@ -329,7 +371,8 @@ Another channel that resolves to `shared-session` will continue the same canonic
 
 ## Runtime guarantees
 
-- Within one runtime process, turns for one session execute in FIFO order; different sessions may execute concurrently.
+- Within one runtime process, turns for one session execute in FIFO order; the slot is reserved before
+  asynchronous Session/Skill preflight, while different sessions may execute concurrently.
 - Explicit recovery uses the same per-session FIFO and cannot race an active turn.
 - A request cancelled before its FIFO admission does not create a Run or append a user message.
 - Steering and cancellation admission close at the Turn's terminal barrier; control messages cannot leak
@@ -344,6 +387,8 @@ Another channel that resolves to `shared-session` will continue the same canonic
 - A tool left in `running` state after a crash is treated as having an unknown outcome and is not replayed.
 - Store `save` operations update an existing version only; a late save cannot recreate a deleted session.
   Existing message prefixes are append-only unless `rewriteMessages` is explicit.
+- A Store that cannot determine whether a save committed throws `SessionSaveOutcomeUnknownError`; the Loop
+  does not attempt another save from the stale Session, and the host must reload before reconciliation.
 - Event observers receive detached frozen values; exceptions, mutation attempts, and unresolved callbacks
   are isolated from canonical run and tool status. Adapters own ordered delivery and backpressure.
 - The runtime does not claim exactly-once execution for external side effects.
@@ -354,7 +399,11 @@ Session-read-only tools receive a detached, deeply frozen Session snapshot. A to
 `sessionAccess: "write"` is a trusted Runtime extension: it receives the live Session and runs as an
 exclusive barrier relative to the rest of its tool batch. Tool results must be JSON-serializable; invalid
 results become model-visible tool failures instead of corrupting persistence. Its checkpoint rewrites the
-complete message history so mutations are durable consistently across Store implementations.
+complete message history so mutations are durable consistently across Store implementations. Because this
+is host-trusted code, it can intentionally change Session metadata, including Runtime-reserved capability
+fields; subsequent queued authorization runs in FIFO order and observes the persisted change. It cannot
+replace Store-protected ownership through a normal checkpoint: an attempted change fails the save instead
+of changing adapter ownership.
 
 `sessionAccess` says nothing about external side effects. Tools that must preserve external ordering use
 `executionPolicy: "exclusive"`; only tools safe to overlap and reorder should use the default parallel
@@ -402,6 +451,7 @@ src/channel/            reusable channel adapters
 src/tools/              local tools
 src/mcp.ts              MCP tool policy, result normalization, refresh and lifecycle
 src/storage/            managed database selection, migrations, and Store lifecycle
+src/legacy/             explicitly isolated deprecated compatibility APIs
 src/session*.ts         session contracts and stores
 examples/               minimal and HTTP runtime examples
 tests/                  runtime and integration tests

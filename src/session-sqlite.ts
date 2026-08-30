@@ -1,10 +1,27 @@
 import { DatabaseSync } from "node:sqlite";
 import { dirname, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
-import { assertValidSessionId, MessageHistoryRewriteRequiredError, SessionAlreadyExistsError, SessionVersionConflictError, type Message, type RunState, type SaveSessionOptions, type Session, type SessionStore, type ToolCallState } from "./session.js";
+import {
+  assertValidSessionId,
+  MessageHistoryRewriteRequiredError,
+  resolveSessionOwnershipSave,
+  restoreSessionOwnership,
+  SessionAlreadyExistsError,
+  SessionVersionConflictError,
+  snapshotSessionOwnership,
+  type Message,
+  type RunState,
+  type SaveSessionOptions,
+  type Session,
+  type SessionCreateOptions,
+  type SessionStore,
+  type ToolCallState,
+} from "./session.js";
 
 /** Durable, transactional store for a single SQLite database. */
 export class SqliteSessionStore implements SessionStore {
+  readonly supportsSessionOwnership = true as const;
+
   private readonly database: DatabaseSync;
   private readonly messageSnapshots = new WeakMap<Session, MessageSnapshot>();
 
@@ -19,11 +36,12 @@ export class SqliteSessionStore implements SessionStore {
   async get(sessionId: string): Promise<Session | undefined> {
     assertValidSessionId(sessionId);
     const row = this.database.prepare(
-      "SELECT id, version, metadata_json, current_run_id FROM sessions WHERE id = ?",
+      "SELECT id, version, metadata_json, ownership_json, current_run_id FROM sessions WHERE id = ?",
     ).get(sessionId) as {
       id: string;
       version: number;
       metadata_json: string;
+      ownership_json: string | null;
       current_run_id: string | null;
     } | undefined;
     if (!row) return undefined;
@@ -32,29 +50,50 @@ export class SqliteSessionStore implements SessionStore {
       `SELECT id, status, phase, round, error, started_at, updated_at
        FROM runs WHERE session_id = ? AND id = ?`,
     ).get(sessionId, row.current_run_id) as Record<string, unknown> | undefined;
+    const ownership = parseStoredOwnership(row.ownership_json);
     const session: Session = {
       id: row.id,
       version: Number(row.version),
       metadata: JSON.parse(row.metadata_json),
       messages,
+      ...(ownership ? { ownership } : {}),
       runState: run ? this.loadRun(run) : undefined,
     };
     this.messageSnapshots.set(session, snapshotMessages(messages));
     return session;
   }
 
-  async create(sessionId: string, metadata: Record<string, unknown> = {}): Promise<Session> {
+  async create(
+    sessionId: string,
+    metadata: Record<string, unknown> = {},
+    options: SessionCreateOptions = {},
+  ): Promise<Session> {
     assertValidSessionId(sessionId);
+    const ownership = snapshotSessionOwnership(options.ownership);
     const now = new Date().toISOString();
     try {
       this.database.prepare(
-        "INSERT INTO sessions (id, version, metadata_json, created_at, updated_at) VALUES (?, 0, ?, ?, ?)",
-      ).run(sessionId, JSON.stringify(metadata), now, now);
+        `INSERT INTO sessions
+         (id, version, metadata_json, ownership_json, created_at, updated_at)
+         VALUES (?, 0, ?, ?, ?, ?)`,
+      ).run(
+        sessionId,
+        JSON.stringify(metadata),
+        ownership ? JSON.stringify(ownership) : null,
+        now,
+        now,
+      );
     } catch (error) {
       if (/UNIQUE constraint failed/.test(String(error))) throw new SessionAlreadyExistsError(sessionId);
       throw error;
     }
-    const session: Session = { id: sessionId, version: 0, messages: [], metadata };
+    const session: Session = {
+      id: sessionId,
+      version: 0,
+      messages: [],
+      metadata,
+      ...(ownership ? { ownership } : {}),
+    };
     this.messageSnapshots.set(session, snapshotMessages([]));
     return session;
   }
@@ -77,22 +116,30 @@ export class SqliteSessionStore implements SessionStore {
     assertValidSessionId(session.id);
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const existing = this.database.prepare("SELECT version FROM sessions WHERE id = ?").get(
-        session.id,
-      ) as { version: number } | undefined;
+      const existing = this.database.prepare(
+        "SELECT version, ownership_json FROM sessions WHERE id = ?",
+      ).get(session.id) as { version: number; ownership_json: string | null } | undefined;
       const expected = session.version ?? 0;
       if (!existing) {
         throw new SessionVersionConflictError(session.id, expected, -1);
       } else if (Number(existing.version) !== expected) {
         throw new SessionVersionConflictError(session.id, expected, Number(existing.version));
       }
+      const ownership = resolveSessionOwnershipSave(
+        session.id,
+        parseStoredOwnership(existing.ownership_json),
+        session.ownership,
+        options.claimOwnership === true,
+      );
       const nextVersion = expected + 1;
       const updated = this.database.prepare(
-        `UPDATE sessions SET version = ?, metadata_json = ?, current_run_id = ?, updated_at = ?
+        `UPDATE sessions
+         SET version = ?, metadata_json = ?, ownership_json = ?, current_run_id = ?, updated_at = ?
          WHERE id = ? AND version = ?`,
       ).run(
         nextVersion,
         JSON.stringify(session.metadata),
+        ownership ? JSON.stringify(ownership) : null,
         session.runState?.id ?? null,
         new Date().toISOString(),
         session.id,
@@ -131,6 +178,7 @@ export class SqliteSessionStore implements SessionStore {
       if (session.runState) this.saveRun(session.id, session.runState);
       this.database.exec("COMMIT");
       session.version = nextVersion;
+      restoreSessionOwnership(session, ownership);
       const previous = this.messageSnapshots.get(session);
       this.messageSnapshots.set(
         session,
@@ -269,11 +317,21 @@ export class SqliteSessionStore implements SessionStore {
       WHERE current_run_id IS NULL;
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, CURRENT_TIMESTAMP);
     `);
+    if (!sessionColumns.some((column) => column.name === "ownership_json")) {
+      this.database.exec("ALTER TABLE sessions ADD COLUMN ownership_json TEXT");
+    }
+    this.database.exec(
+      "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, CURRENT_TIMESTAMP)",
+    );
   }
 }
 
 function nullableString(value: unknown): string | undefined {
   return value == null ? undefined : String(value);
+}
+
+function parseStoredOwnership(value: unknown): Session["ownership"] {
+  return value == null ? undefined : snapshotSessionOwnership(JSON.parse(String(value)));
 }
 
 interface MessageSnapshot {

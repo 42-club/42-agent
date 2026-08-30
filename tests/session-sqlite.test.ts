@@ -6,12 +6,12 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   AgentLoop,
-  ConversationCompressionTool,
-  SqliteSessionStore,
   ToolRegistry,
   createMessage,
   type ModelClient,
 } from "../src/index.js";
+import { SqliteSessionStore } from "../src/storage/index.js";
+import { ConversationCompressionTool } from "../src/tools/index.js";
 
 test("SQLite persists messages, runs, and tool calls across store instances", async () => {
   const directory = await mkdtemp(join(tmpdir(), "42-agent-sqlite-"));
@@ -216,6 +216,71 @@ test("SQLite rejects non-well-formed Unicode session IDs", async () => {
     await assert.rejects(store.create("\ud800"), { name: "InvalidSessionIdError" });
     await assert.rejects(store.get("\ud801"), { name: "InvalidSessionIdError" });
     assert.ok(await store.create("\ufffd"));
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("SQLite migrates version 2 Sessions to nullable protected ownership", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-sqlite-ownership-migration-"));
+  const filename = join(directory, "sessions.sqlite");
+  const timestamp = "2026-01-01T00:00:00.000Z";
+  const legacyMetadata = {
+    "runtime.binding": { version: 1, kind: "adapter", value: "legacy-owner" },
+  };
+  const bootstrap = new DatabaseSync(filename);
+  bootstrap.exec(`
+    CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    );
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      version INTEGER NOT NULL,
+      metadata_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      current_run_id TEXT
+    );
+    INSERT INTO schema_migrations(version, applied_at)
+    VALUES (1, CURRENT_TIMESTAMP), (2, CURRENT_TIMESTAMP);
+  `);
+  bootstrap.prepare(
+    `INSERT INTO sessions
+     (id, version, metadata_json, created_at, updated_at, current_run_id)
+     VALUES (?, 0, ?, ?, ?, NULL)`,
+  ).run("legacy", JSON.stringify(legacyMetadata), timestamp, timestamp);
+  bootstrap.close();
+
+  const store = new SqliteSessionStore(filename);
+  try {
+    const legacy = await store.get("legacy");
+    assert.deepEqual(legacy?.metadata, legacyMetadata);
+    assert.equal(legacy?.ownership, undefined);
+
+    const owned = await store.create("owned", {}, {
+      ownership: { version: 1, kind: "adapter", value: "new-owner" },
+    });
+    assert.equal((await store.get(owned.id))?.ownership?.value, "new-owner");
+
+    const observer = new DatabaseSync(filename);
+    try {
+      const columns = observer.prepare("PRAGMA table_info(sessions)").all() as Array<{
+        name: string;
+      }>;
+      const versions = observer.prepare(
+        "SELECT version FROM schema_migrations ORDER BY version",
+      ).all() as Array<{ version: number }>;
+      const legacyRow = observer.prepare(
+        "SELECT ownership_json FROM sessions WHERE id = ?",
+      ).get("legacy") as { ownership_json: string | null } | undefined;
+      assert.ok(columns.some((column) => column.name === "ownership_json"));
+      assert.deepEqual(versions.map((row) => Number(row.version)), [1, 2, 3]);
+      assert.equal(legacyRow?.ownership_json, null);
+    } finally {
+      observer.close();
+    }
   } finally {
     store.close();
     await rm(directory, { recursive: true, force: true });

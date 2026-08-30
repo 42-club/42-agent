@@ -64,3 +64,56 @@ test("fallback request estimation covers system prompts, schemas, and tool-call 
     estimateModelRequestTokens(systemHeavy),
   );
 });
+
+test("fallback request estimation ignores unsent metadata and tolerates non-JSON tool arguments", () => {
+  const base: ModelRequest = {
+    systemPrompt: "system",
+    messages: [{ role: "user", content: "go" }],
+    tools: [],
+  };
+  const circularMetadata: Record<string, unknown> = { auditId: 1n };
+  circularMetadata.self = circularMetadata;
+  const withUnsentMetadata: ModelRequest = {
+    ...base,
+    messages: [{
+      role: "user",
+      content: "go",
+      createdAt: "2026-08-30T00:00:00.000Z",
+      metadata: {
+        uiState: "x".repeat(10_000),
+        nonJson: circularMetadata,
+      },
+    }],
+  };
+  assert.equal(
+    estimateModelRequestTokens(withUnsentMetadata),
+    estimateModelRequestTokens(base),
+  );
+
+  const circularArguments: Record<string, unknown> = { amount: 1n };
+  circularArguments.self = circularArguments;
+  const assistantWithoutToolCall: ModelRequest = {
+    ...base,
+    messages: [{ role: "assistant", content: "" }],
+  };
+  const withToolCall: ModelRequest = {
+    ...base,
+    messages: [{
+      role: "assistant",
+      content: "",
+      metadata: {
+        ignored: circularMetadata,
+        toolCalls: [{
+          id: "call-1",
+          name: "lookup",
+          arguments: circularArguments,
+        }],
+      },
+    }],
+  };
+  assert.doesNotThrow(() => estimateModelRequestTokens(withToolCall));
+  assert.ok(
+    estimateModelRequestTokens(withToolCall)
+      > estimateModelRequestTokens(assistantWithoutToolCall),
+  );
+});

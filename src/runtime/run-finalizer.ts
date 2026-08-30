@@ -5,12 +5,14 @@ import type {
   Message,
   RunState,
   SaveSessionOptions,
-  Session,
 } from "../session.js";
-import { reconcileToolCallSnapshot } from "./run-recovery.js";
+import {
+  reconcileToolCallSnapshot,
+  type RunPolicySessionSnapshot,
+} from "./run-recovery.js";
 
 interface RunFinalizationBaseSnapshot {
-  session: DeepReadonly<Session>;
+  session: DeepReadonly<RunPolicySessionSnapshot>;
   now: string;
 }
 

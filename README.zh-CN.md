@@ -51,9 +51,23 @@ Prompt，而不会无限堆积更新。Prompt 支持文本和基础 `resource_li
 `name`、`title` 与 `version` 用于配置初始化时返回的 Agent 身份。
 
 必填的 `workspaceRoot` 是宿主 Tool 或 Sandbox 已经强制执行的规范根目录。ACP Session 的 `cwd`
-必须解析到同一目录；Adapter 不会动态重配 Tool 根目录。Resume、Prompt 与 Delete 还会要求 Session
-中存储的 `acp.cwd` 完全匹配；缺失或外来的 Workspace Metadata 会被拒绝，且不会泄漏已有 Session
-是否属于其他 Workspace。Resume 与 Prompt 会拒绝不存在的 Session，Delete 则保持幂等。
+必须解析到同一目录；Adapter 不会动态重配 Tool 根目录。新 ACP Session 会获得绑定该目录的受保护
+Runtime Binding，通用 Session Metadata 无法设置或替换它。Resume、Prompt、Cancel 与 Delete 会原子
+校验同一 Binding，因此伪造 Metadata Key 或 Delete/Recreate 竞态都不能越过 Adapter 所有权边界。
+缺失或外来的 Binding 会被拒绝，且不会泄漏已有 Session 是否属于其他 Workspace。Resume 与 Prompt
+会拒绝不存在的 Session，Delete 则保持幂等。Binding 使用精确的版本化封装
+`{ version: 1, kind, value }`，并通过 Store 保护的顶层字段（数据库 Store 使用独立列）持久化。可信边界
+是 Store 明确声明的保护能力及其写入路径，而不是 JSON 外形；通用 Metadata 中任意形状的
+`runtime.binding` 与升级前的 `acp.cwd` 都没有可信来源，默认会被隔离，并在未绑定 Channel 中表现为
+Session 不存在。当前通用 Metadata 也会剥离这两个保留 Key；自定义 Session Store 必须显式实现原子
+创建/认领的保护契约后才能使用 Runtime Binding。File Store 也会忽略旧版原始 Session JSON 中的
+`ownership`；只有带新 magic framing 的容器才具有受保护来源。如需保留已确认的旧 ACP Session，
+宿主必须通过 `authorizeLegacySessionMigration` 按可信 Session-ID Allowlist 或外部清单显式授权，
+不能只依据持久化的
+`acp.cwd`。授权后 Runtime 会在同一 Session FIFO 内重新核验旧 Marker、删除它并只保存一次；若保存
+结果未知，则原样返回给宿主并要求重新加载确认。回调会收到 `AbortSignal`；Delete 与断连会取消并等待
+尚未完成的授权，Delete 期间同一 Session 的新 Resume/Prompt 也不会被接纳。
+
 `session/cancel` 只影响由当前 Adapter 接纳的 Prompt。要把 Runtime 审批桥接到当前 ACP Client，
 构建 `AgentLoop` 与 ACP Adapter 时必须使用同一个 `AcpPermissionBridge`。下例假设 `model`、`tools`
 和 `sessionStore` 已按 [`examples/minimal.ts`](./examples/minimal.ts) 完成配置：
@@ -72,7 +86,6 @@ const loop = new AgentLoop({
   requestApproval: permissions.requestApproval,
 });
 const runtime = new AgentRuntime({ loop });
-await runtime.start();
 
 const app = createAcpAgent(runtime, {
   workspaceRoot: process.cwd(), // 必须与宿主 Tool/Sandbox 根目录一致。
@@ -128,6 +141,7 @@ Channel C ─┘
 - 协议无关的 `AgentRuntime` 生命周期，覆盖 Session、Prompt、取消、Steering 和能力查询
 - `AgentRuntime` 从 `AgentLoop` 派生并校验唯一的 `SessionStore`、`ToolRegistry` 与 Skill Loader
 - Runtime、Session 和 Turn 级 Tool/Skill 选择，Prompt 不直接注入能力实现
+- 受保护的协议 Binding，以及每个 Turn 的不可变 Tool 与 Skill 快照
 - 只读工具仅接收与 Runtime 隔离的深度不可变 Session 快照
 - 显式可并行 Tool 有界并发；需要副作用顺序或受信任写权限的 Tool 独占执行
 - 与 Model、Tool 参数、Event 和 Runtime DTO 隔离的服务端规范状态
@@ -142,7 +156,7 @@ Channel C ─┘
 - 托管数据库在启动时按 PostgreSQL > Supabase > SQLite 选择，失败时不自动回退
 - 模型请求、恢复和终态策略只返回计划，统一由 `AgentLoop` 应用并持久化
 - 同一 Session 的 Turn 与恢复共用 FIFO，不同 Session 并发执行
-- 仅接受格式完好的 Unicode Session ID，File Store 使用固定长度摘要路径并核对文件内规范 ID
+- 仅接受非空、不含 NUL 且格式完好的 Unicode Session ID，File Store 使用固定长度摘要路径并核对文件内规范 ID
 
 ## 架构
 
@@ -150,8 +164,9 @@ Channel C ─┘
 Skill Loader，避免校验、执行、关闭与恢复连接到不同的事实来源。`AgentLoop` 持有 per-session FIFO
 协调器并保持为唯一核心变更协调者；`ModelRequestPlanner`、`RunRecovery` 与 `RunFinalizer` 只返回
 计划，由 Loop 应用、保存并安排 Event 顺序。Loop 内部的协调式 Tool Executor 只接收私有的 per-Run
-Mutation Gate，由该 Gate 把获准变更与其检查点串行绑定。公开导出的 `ToolExecutor` 只为兼容旧的
-直接构造 API 而保留并已弃用，`AgentLoop` 不使用它。`SessionStore` 是持久化边界。Channel 负责
+Mutation Gate，由该 Gate 把获准变更与其检查点串行绑定。已弃用的 `ToolExecutor` 仅从
+`42-agent/legacy` 提供旧版直接构造 API；`AgentLoop` 不使用它，它也不属于稳定核心入口。
+`SessionStore` 是持久化边界。Channel 负责
 规范化输入并投影 best-effort 事件；Provider 负责统一模型 API；Tool 负责执行能力。边界、数据库
 选择与恢复语义详见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
 
@@ -178,8 +193,23 @@ npm run check
 函数至少 80%。GitHub Actions 会在 Node.js 22.13、24 和 26 上执行 Lint、类型检查、覆盖率门禁及
 `npm pack --dry-run`。
 
-Package 入口指向 `dist/src/index.js` 及对应类型声明，并通过 `42-agent/acp` 暴露 ACP Adapter，
-通过 `42-agent/storage` 暴露托管数据库 Store。
+Package 根入口只导出协议无关核心：`AgentLoop`、`AgentRuntime`、规范 Model/Session 契约、Skill 与
+`ToolRegistry`。集成能力使用明确的公开子路径：
+
+- `42-agent/acp`：ACP Adapter
+- `42-agent/channel`：Channel Runtime、HTTP Server/Client 与 Channel 契约
+- `42-agent/provider`：Provider Adapter，包括 OpenRouter 与 AI SDK
+- `42-agent/storage`：File、SQLite、PostgreSQL/Supabase 与托管 Store 生命周期
+- `42-agent/tools`：Tool 契约、Bash 与会话压缩
+- `42-agent/mcp`：MCP Tool 适配与生命周期
+- `42-agent/legacy`：仅提供已弃用的 `ToolExecutor` 兼容 API
+
+导入 `42-agent` 不再加载 ACP、Provider、Channel、PostgreSQL 等可选 Adapter Barrel。原先从根入口
+导入这些符号（包括 `ToolExecutor`）的代码需要迁移到对应子路径；内部 `src/runtime/*` 策略对象不
+属于 Package Export。本版本同时移除了无实际启动语义的 `AgentRuntime.start()`；Runtime 构造后即可
+直接使用。`RuntimeStopReason` 现在只有 `"end_turn"`，取消和失败会使 `prompt()` Reject（ACP 会把取消
+映射为协议自身的 Stop Reason）。此外，`SessionInfo.skills` 与 `SessionInfo.tools` 已改为明确的
+`CapabilityScope` 判别联合；调用方应先按 `mode` 分支，再读取 `names`，不能继续把它们当作数组。
 项目采用 [Apache-2.0](./LICENSE) 许可证，并已配置为可公开发布到 npm。公开发布使用语义化版本，
 且必须由维护者显式执行；`npm pack --dry-run` 只校验发布内容，不会实际发布。
 
@@ -230,18 +260,20 @@ Pooler](https://supabase.com/docs/guides/database/connecting-to-postgres)。Post
 `agent_runtime` Schema，并以 `(namespace, Session ID)` 为键；应用必须保证不会有两个进程同时拥有
 同一组合。
 
-对每个 Supabase `databaseUrl` 和 `migrationUrl`，如果该 URL 不包含任何 PostgreSQL TLS 参数
-（`ssl`、`sslmode`、`sslcert`、`sslkey`、`sslrootcert` 或 `sslnegotiation`），TLS 默认为
-`ssl: true`；如果 URL 已包含其中任一参数，本库会让 `pg` 为该连接解析 TLS 设置。Profile 级
-`ssl` 显式配置不能与任一 URL 中的 TLS 参数混用。只有在本地或自托管数据库明确使用明文连接时
-才设置 `ssl: false`；Hosted Supabase 绝不能关闭 TLS。安全解析诊断会在本库决定 TLS 时显示
-`ssl`，由 URL 控制 TLS 时则省略该字段。
+对每个 Supabase `databaseUrl` 和 `migrationUrl`，除非 URL 中存在真正配置 SSL 的选项（`ssl`、
+`sslmode`、`sslcert`、`sslkey`、`sslrootcert` 或 `sslnegotiation=direct`），TLS 都默认为
+`ssl: true`。单独的 `sslnegotiation=postgres` 只改变握手方式，因此仍保留安全默认值。空值、重复值
+或未知的协商参数会被直接拒绝，避免意外关闭 TLS。URL 配置 SSL 时由 `pg` 解析最终值，Profile 级
+`ssl` 不能与这些 URL 选项混用。只有在本地或自托管数据库明确使用明文连接时才设置 `ssl: false`；
+Hosted Supabase 绝不能关闭 TLS。安全解析诊断会在本库决定 TLS 时显示 `ssl`，由 URL 控制 TLS 时则
+省略该字段。
 
 PostgreSQL 引擎默认以 `schemaMode: "check"` 启动。DDL 应通过部署步骤显式执行：调用
 `migratePostgresSchema(...)`，或为 Profile 显式设置 `schemaMode: "migrate"`；可选的
 `migrationConnectionString`/`migrationUrl` 可把迁移所需的高权限凭据与 Runtime 凭据分离。
 该显式调用应置于部署流水线；Supabase 提供了[数据库迁移流程](https://supabase.com/docs/guides/deployment/database-migrations)
-说明。`openSessionStore` 会在返回前完成 Readiness 检查。
+说明。`openSessionStore` 会在返回前完成 Readiness 检查，包括迁移完整性及文档列出的每一项 Runtime
+Schema/Table 权限。
 
 独立迁移 API 也要求显式 Profile，因此 Supabase 会保持相同的安全 TLS 默认值：
 
@@ -296,8 +328,9 @@ npm run runtime
 
 HTTP Server 是可信开发环境下的 Adapter，不是生产入口：它不提供认证，默认只监听 loopback，
 浏览器 Origin 必须与显式 `allowedOrigin` 精确匹配，请求必须为 JSON，请求体与待发送 Event 都有
-大小上限，也不会注册可选的 Bash 工具。认证、Host/DNS-rebinding 防护、租户、限流和部署策略
-属于嵌入 Runtime 的上层应用。
+大小上限，也不会注册可选的 Bash 工具。入场错误会返回分类后的 4xx；内部错误使用固定通用文案，
+流式 Event 中的内部错误消息和 Code 也会脱敏。认证、Host/DNS-rebinding 防护、租户、限流和部署
+策略属于嵌入 Runtime 的上层应用。
 
 随后使用显式 Session ID 启动 CLI：
 
@@ -309,7 +342,8 @@ npm run cli -- --session shared-session
 
 ## Runtime 保证
 
-- 在一个 Runtime 进程内，同一 Session 的 Turn 按 FIFO 顺序执行；不同 Session 可以并发执行。
+- 在一个 Runtime 进程内，同一 Session 的 Turn 按 FIFO 顺序执行；FIFO 槽位会在异步 Session/Skill
+  预检前预留，不同 Session 仍可并发执行。
 - 显式恢复使用同一 per-session FIFO，不会与活动 Turn 竞态执行。
 - 在进入 FIFO 执行槽位前已取消的请求不会创建 Run，也不会追加 User Message。
 - Steering 与取消在 Turn 终态屏障处关闭入场；控制消息不会泄漏到下一个 Turn。
@@ -323,6 +357,8 @@ npm run cli -- --session shared-session
 - 崩溃时仍处于 `running` 状态的工具，其结果会被视为未知，不会自动重放。
 - Store 的 `save` 只更新已存在的版本；晚到保存不能重新创建已删除 Session。默认只允许追加
   Message；修改已有 Message 必须显式使用 `rewriteMessages`。
+- Store 无法判断一次保存是否已经提交时会抛出 `SessionSaveOutcomeUnknownError`；Loop 不会使用旧
+  Session 再次保存，宿主必须重新加载后再对账。
 - Event Observer 只收到深拷贝冻结值；异常、篡改尝试和永不完成的回调都不会改变或卡住规范状态。
   Adapter 自己负责事件顺序与背压。
 - Runtime 不保证具有外部副作用的操作 exactly-once 执行。
@@ -332,7 +368,10 @@ npm run cli -- --session shared-session
 Session 只读 Tool 接收与 Runtime 隔离、深度冻结的 Session 快照。声明 `sessionAccess: "write"` 的 Tool
 属于受信任的 Runtime 扩展：它可以访问 live Session，并相对于同批其他工具以独占屏障执行。
 Tool 结果必须能够 JSON 序列化；非法结果会成为模型可见的 Tool Failure，而不会破坏持久化状态。
-其检查点会重写完整消息历史，保证已有消息的修改在不同 Store 中具有一致的持久化语义。
+其检查点会重写完整消息历史，保证已有消息的修改在不同 Store 中具有一致的持久化语义。由于它是
+宿主信任的代码，也可以有意修改 Session Metadata，包括 Runtime 保留的能力字段；后续排队的授权
+会在 FIFO 槽位内观察到已持久化的变化。但普通检查点不能替换 Store 保护的 Ownership；尝试修改会
+让保存失败，而不会改变 Adapter 所有权。
 
 `sessionAccess` 不代表工具没有外部副作用。需要保证外部执行顺序的 Tool 应声明
 `executionPolicy: "exclusive"`；只有允许重叠和乱序的 Tool 才使用默认并行策略。Bash 为独占执行，
@@ -377,6 +416,7 @@ src/channel/            可复用的 Channel Adapter
 src/tools/              本地工具
 src/mcp.ts              MCP Tool 策略、结果规范化、刷新与生命周期
 src/storage/            托管数据库选择、迁移和 Store 生命周期
+src/legacy/             显式隔离的已弃用兼容 API
 src/session*.ts         Session 契约和 Store
 examples/               最小示例和 HTTP Runtime 示例
 tests/                  Runtime 与集成测试

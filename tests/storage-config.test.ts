@@ -145,6 +145,106 @@ test("Supabase runtime and migration URLs resolve TLS independently", () => {
   }), { name: "DatabaseConfigurationError" });
 });
 
+test("Supabase TLS defaults survive negotiation-only URLs and reject empty TLS parameters", () => {
+  const traditionalNegotiationUrl = `${supabase}?sslnegotiation=postgres`;
+  assert.equal(resolveSessionDatabaseConfig({
+    namespace: "tls",
+    supabase: { databaseUrl: traditionalNegotiationUrl },
+  }).ssl, true);
+
+  const defaultTlsClient = new Client(createPostgresPoolConfig({
+    connectionString: traditionalNegotiationUrl,
+    namespace: "tls",
+    profile: "supabase",
+  }));
+  assert.equal(defaultTlsClient.ssl, true);
+  assert.equal(effectiveClientSsl(defaultTlsClient), true);
+
+  const explicitPlaintextClient = new Client(createPostgresPoolConfig({
+    connectionString: traditionalNegotiationUrl,
+    namespace: "tls",
+    profile: "supabase",
+    ssl: false,
+  }));
+  assert.equal(explicitPlaintextClient.ssl, false);
+  assert.equal(effectiveClientSsl(explicitPlaintextClient), false);
+
+  const migrationClient = new Client(createPostgresMigrationPoolConfig({
+    profile: "supabase",
+    databaseUrl: traditionalNegotiationUrl,
+  }));
+  assert.equal(migrationClient.ssl, true);
+  assert.equal(effectiveClientSsl(migrationClient), true);
+
+  const directNegotiationUrl = `${supabase}?sslnegotiation=direct`;
+  assert.equal(resolveSessionDatabaseConfig({
+    namespace: "tls",
+    supabase: { databaseUrl: directNegotiationUrl },
+  }).ssl, undefined);
+  const directNegotiationClient = new Client(createPostgresPoolConfig({
+    connectionString: directNegotiationUrl,
+    namespace: "tls",
+    profile: "supabase",
+  }));
+  assert.equal(directNegotiationClient.ssl, true);
+  assert.equal(effectiveClientSsl(directNegotiationClient), true);
+  assert.throws(() => createPostgresPoolConfig({
+    connectionString: directNegotiationUrl,
+    namespace: "tls",
+    profile: "supabase",
+    ssl: true,
+  }), { name: "DatabaseConfigurationError" });
+
+  for (const parameter of [
+    "ssl",
+    "sslmode",
+    "sslcert",
+    "sslkey",
+    "sslrootcert",
+    "sslnegotiation",
+  ]) {
+    assert.throws(() => resolveSessionDatabaseConfig({
+      namespace: "tls",
+      supabase: { databaseUrl: `${supabase}?${parameter}=` },
+    }), {
+      name: "DatabaseConfigurationError",
+      message: `PostgreSQL TLS parameter ${parameter} in supabase.databaseUrl must not be empty`,
+    });
+  }
+
+  for (const [parameter, first, second] of [
+    ["ssl", "1", "0"],
+    ["sslmode", "verify-full", "disable"],
+    ["sslcert", "/tmp/first-cert", "/tmp/second-cert"],
+    ["sslkey", "/tmp/first-key", "/tmp/second-key"],
+    ["sslrootcert", "/tmp/first-root", "/tmp/second-root"],
+    ["sslnegotiation", "direct", "postgres"],
+  ]) {
+    assert.throws(() => resolveSessionDatabaseConfig({
+      namespace: "tls",
+      supabase: { databaseUrl: `${supabase}?${parameter}=${first}&${parameter}=${second}` },
+    }), {
+      name: "DatabaseConfigurationError",
+      message: `PostgreSQL TLS parameter ${parameter} in supabase.databaseUrl must not be repeated`,
+    });
+  }
+
+  assert.throws(() => resolveSessionDatabaseConfig({
+    namespace: "tls",
+    supabase: { databaseUrl: `${supabase}?sslnegotiation=starttls` },
+  }), {
+    name: "DatabaseConfigurationError",
+    message: "PostgreSQL TLS parameter sslnegotiation in supabase.databaseUrl must be postgres or direct",
+  });
+  assert.throws(() => createPostgresMigrationPoolConfig({
+    profile: "supabase",
+    databaseUrl: `${supabase}?sslmode=%20`,
+  }), {
+    name: "DatabaseConfigurationError",
+    message: "PostgreSQL TLS parameter sslmode in databaseUrl must not be empty",
+  });
+});
+
 test("standalone schema migration config is profile-aware and TLS-safe", () => {
   const supabaseDefault = createPostgresMigrationPoolConfig({
     profile: "supabase",
@@ -185,6 +285,7 @@ test("database config rejects missing, partial, and illegal profiles before sele
   const invalid: unknown[] = [
     { namespace: "agent" },
     { namespace: "", sqlite: { filename: "x" } },
+    { namespace: "agent\0tenant", sqlite: { filename: "x" } },
     { namespace: "agent", postgres: {} },
     { namespace: "agent", postgres: { connectionString: "https://example.com/db" } },
     { namespace: "agent", supabase: { databaseUrl: "" } },
@@ -223,7 +324,16 @@ test("database config rejects missing, partial, and illegal profiles before sele
       { name: "DatabaseConfigurationError" },
     );
   }
+  assert.throws(() => new PostgresSessionStore({
+    connectionString: postgres,
+    namespace: "direct\0namespace",
+  }), { name: "DatabaseConfigurationError" });
 });
+
+function effectiveClientSsl(client: Client): unknown {
+  return (client as unknown as { connectionParameters: { ssl: unknown } })
+    .connectionParameters.ssl;
+}
 
 test("SQLite factory returns a managed Store with idempotent close", async () => {
   const directory = await mkdtemp(join(tmpdir(), "42-agent-managed-sqlite-"));
@@ -232,7 +342,10 @@ test("SQLite factory returns a managed Store with idempotent close", async () =>
     const store = await openSessionStore({ namespace: "local", sqlite: { filename } });
     assert.equal(store.profile, "sqlite");
     assert.equal(store.engine, "sqlite");
-    const session = await store.create("managed");
+    assert.equal(store.supportsSessionOwnership, true);
+    const session = await store.create("managed", {}, {
+      ownership: { version: 1, kind: "adapter", value: "managed-owner" },
+    });
     session.messages.push({ role: "user", content: "hello" });
     await store.save(session);
     const firstClose = store.close();
@@ -242,6 +355,7 @@ test("SQLite factory returns a managed Store with idempotent close", async () =>
 
     const reopened = await openSessionStore({ namespace: "local", sqlite: { filename } });
     assert.equal((await reopened.get("managed"))?.messages[0]?.content, "hello");
+    assert.equal((await reopened.get("managed"))?.ownership?.value, "managed-owner");
     await reopened.close();
   } finally {
     await rm(directory, { recursive: true, force: true });

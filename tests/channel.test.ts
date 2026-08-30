@@ -3,15 +3,17 @@ import test from "node:test";
 import {
   AgentLoop,
   AgentRuntime,
-  ChannelRuntime,
-  ConversationCompressionTool,
   InMemorySessionStore,
-  type ChannelAdapter,
-  type ChannelInboundMessage,
-  type ChannelOutboundMessage,
   type ModelClient,
   ToolRegistry,
 } from "../src/index.js";
+import {
+  ChannelRuntime,
+  type ChannelAdapter,
+  type ChannelInboundMessage,
+  type ChannelOutboundMessage,
+} from "../src/channel/index.js";
+import { ConversationCompressionTool } from "../src/tools/index.js";
 
 interface TestEvent {
   conversation: string;

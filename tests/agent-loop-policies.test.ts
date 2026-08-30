@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ModelRequestPlanner } from "../src/runtime/model-request-planner.js";
 import { RunFinalizer } from "../src/runtime/run-finalizer.js";
-import { RunRecovery } from "../src/runtime/run-recovery.js";
-import type { Session } from "../src/session.js";
+import {
+  RunRecovery,
+  type RunPolicySessionSnapshot,
+} from "../src/runtime/run-recovery.js";
 
 const timestamp = "2026-08-29T00:00:00.000Z";
 
@@ -15,7 +17,6 @@ test("RunRecovery plans protocol repair without mutating its frozen snapshot", (
       content: "",
       metadata: { toolCalls: [{ id: "pending", name: "effect", arguments: {} }] },
     }],
-    metadata: {},
     runState: {
       id: "run",
       status: "running",
@@ -49,7 +50,6 @@ test("RunFinalizer returns terminal checkpoint and event plans without side effe
   const snapshot = frozenSession({
     id: "finalizer-policy",
     messages: [],
-    metadata: {},
     runState: {
       id: "run",
       status: "running",
@@ -157,7 +157,7 @@ test("ModelRequestPlanner owns prompt, budget, and bounded compression decisions
   assert.equal(bounded.kind, "reject");
 });
 
-function frozenSession(session: Session): Session {
+function frozenSession(session: RunPolicySessionSnapshot): RunPolicySessionSnapshot {
   return deepFreeze(structuredClone(session));
 }
 

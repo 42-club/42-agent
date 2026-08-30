@@ -20,11 +20,16 @@ import { ModelRunner } from "./runtime/model-runner.js";
 import { RetryPolicy, type RetryPolicyOptions, throwIfAborted } from "./runtime/retry.js";
 import { normalizeRuntimeError } from "./runtime/errors.js";
 import { RunFinalizer } from "./runtime/run-finalizer.js";
-import { RunRecovery, type RecoveryResult } from "./runtime/run-recovery.js";
+import {
+  RunRecovery,
+  type RecoveryResult,
+  type RunPolicySessionSnapshot,
+} from "./runtime/run-recovery.js";
 import { SteeringQueue } from "./runtime/steering.js";
 import { CoordinatedToolExecutor } from "./runtime/tool-executor.js";
 import {
   createMessage,
+  SessionSaveOutcomeUnknownError,
   type RunState,
   type SaveSessionOptions,
   type Session,
@@ -59,6 +64,18 @@ export interface TurnExecutionResult {
   stopReason: "end_turn";
 }
 
+/** @internal */
+export interface PreparedSkillSelection {
+  readonly names: readonly string[];
+  readonly instructions: readonly string[];
+}
+
+/** @internal */
+export interface PreparedRuntimeTurn {
+  readonly input: RunTurnInput;
+  readonly skills: PreparedSkillSelection;
+}
+
 export type { RecoveryResult } from "./runtime/run-recovery.js";
 
 interface RunMutationGate {
@@ -76,6 +93,7 @@ export class AgentLoop {
   private readonly runFinalizer = new RunFinalizer();
   private readonly steering = new SteeringQueue();
   private readonly sessionTails = new Map<string, Promise<void>>();
+  private readonly preparedSkillSelections = new WeakSet<PreparedSkillSelection>();
 
   constructor(
     private readonly dependencies: {
@@ -125,10 +143,32 @@ export class AgentLoop {
     return this.enqueueSession(sessionId, () => this.recoverSessionSerialized(sessionId));
   }
 
+  /** Reserve FIFO order before Runtime performs asynchronous authorization. @internal */
+  recoverSessionDeferred(
+    sessionId: string,
+    authorize: () => Promise<void>,
+  ): Promise<RecoveryResult> {
+    return this.enqueueSession(sessionId, async () => {
+      await authorize();
+      return this.recoverSessionSerialized(sessionId);
+    });
+  }
+
+  /**
+   * Run one trusted Runtime lifecycle mutation in the canonical Session FIFO.
+   * The callback must not re-enter this method for the same Session. @internal
+   */
+  runSessionOperationDeferred<Result>(
+    sessionId: string,
+    operation: () => Promise<Result>,
+  ): Promise<Result> {
+    return this.enqueueSession(sessionId, operation);
+  }
+
   private async recoverSessionSerialized(sessionId: string): Promise<RecoveryResult> {
     const session = await this.dependencies.sessionStore.get(sessionId);
     const plan = this.runRecovery.plan(immutableSnapshot({
-      session,
+      session: session ? runPolicySessionSnapshot(session) : undefined,
       now: new Date().toISOString(),
     }));
     if (plan.kind === "noop") return plan.result;
@@ -150,18 +190,66 @@ export class AgentLoop {
 
   async runTurnDetailed(input: RunTurnInput): Promise<TurnExecutionResult> {
     const request = snapshotRunTurnInput(input);
-    return this.enqueueSession(request.sessionId, () => this.runTurnSerialized(request));
+    return this.enqueueSession(request.sessionId, async () => {
+      const skills = await this.prepareSkillSelection(request.skills, request.signal);
+      this.consumePreparedSkillSelection(request, skills);
+      return this.runTurnSerialized(request, skills);
+    });
   }
 
-  private async runTurnSerialized(input: RunTurnInput): Promise<TurnExecutionResult> {
+  /** Resolve one immutable Skill snapshot for AgentRuntime admission. @internal */
+  async prepareSkillSelection(
+    names: readonly string[] | undefined,
+    signal?: AbortSignal,
+  ): Promise<PreparedSkillSelection> {
+    throwIfAborted(signal);
+    const selected = [...(names ?? [])];
+    assertUniqueNames("skill", selected);
+    let instructions: readonly string[] = [];
+    if (selected.length > 0) {
+      if (!this.dependencies.skillLoader) throw new Error("No SkillLoader configured");
+      const loaded = await this.dependencies.skillLoader.load(selected);
+      throwIfAborted(signal);
+      if (loaded.length !== selected.length
+        || loaded.some((skill, index) => skill.name !== selected[index])) {
+        throw new Error("SkillLoader returned a selection that does not match the request");
+      }
+      instructions = loaded.map((skill) => skill.instructions);
+    }
+    const snapshot = immutableSnapshot({ names: selected, instructions });
+    this.preparedSkillSelections.add(snapshot);
+    return snapshot;
+  }
+
+  /** Reserve FIFO order before Runtime resolves Session ownership and capabilities. @internal */
+  runTurnDetailedDeferred(
+    sessionId: string,
+    prepare: () => Promise<PreparedRuntimeTurn>,
+  ): Promise<TurnExecutionResult> {
+    return this.enqueueSession(sessionId, async () => {
+      const prepared = await prepare();
+      const request = snapshotRunTurnInput(prepared.input);
+      if (request.sessionId !== sessionId) {
+        throw new Error("Prepared Runtime Turn changed its reserved Session ID");
+      }
+      this.consumePreparedSkillSelection(request, prepared.skills);
+      return this.runTurnSerialized(request, prepared.skills);
+    });
+  }
+
+  private async runTurnSerialized(
+    input: RunTurnInput,
+    skills: PreparedSkillSelection,
+  ): Promise<TurnExecutionResult> {
     // A request cancelled before admission (including while waiting in the
     // per-session FIFO) must not create a Run or append a user message.
     throwIfAborted(input.signal);
     // Capability resolution is admission validation and must not mutate or
     // recover a Session when the requested scope itself is invalid.
-    const activeTools: ToolRegistry = input.tools
+    const activeTools = input.tools
       ? this.dependencies.tools.select(input.tools)
-      : this.dependencies.tools;
+      : this.dependencies.tools.snapshot();
+    const systemPrompt = this.buildSystemPrompt(input, skills.instructions);
     await this.recoverSessionSerialized(input.sessionId);
     const session = await this.dependencies.sessionStore.getOrCreate(input.sessionId);
     const rewroteLegacySummaries = demoteLegacyConversationSummaries(session.messages);
@@ -197,7 +285,6 @@ export class AgentLoop {
 
     try {
       throwIfAborted(input.signal);
-      const systemPrompt = await this.resolveSystemPrompt(input);
       for (let round = 0; round < this.maxToolRounds; round += 1) {
         throwIfAborted(input.signal);
         const modelRequest = await this.prepareModelRequest(
@@ -259,7 +346,7 @@ export class AgentLoop {
 
         const plan = this.runFinalizer.plan(immutableSnapshot({
           kind: "completed" as const,
-          session,
+          session: runPolicySessionSnapshot(session),
           content,
           now: new Date().toISOString(),
         }));
@@ -281,13 +368,18 @@ export class AgentLoop {
       throw new Error("Agent exceeded maximum tool rounds");
     } catch (error) {
       this.steering.end(session.id, runState.id);
+      // The failed checkpoint may already be durable while this live Session
+      // still carries its old version. Reload is the only safe next action;
+      // attempting a terminal checkpoint here could overwrite state or mask
+      // the outcome-unknown error with a version conflict.
+      if (error instanceof SessionSaveOutcomeUnknownError) throw error;
       const cancelled = input.signal?.aborted || isAbortError(error);
       // A checkpoint can fail after the assistant tool-call message or a live
       // call-state mutation. Always close that protocol batch before persisting
       // the terminal Run so the next model request never sees orphaned calls.
       const plan = this.runFinalizer.plan(immutableSnapshot({
         kind: "failed" as const,
-        session,
+        session: runPolicySessionSnapshot(session),
         cancelled,
         errorMessage: error instanceof Error ? error.message : String(error),
         error: normalizeRuntimeError(error),
@@ -305,6 +397,17 @@ export class AgentLoop {
     }
   }
 
+  private consumePreparedSkillSelection(
+    input: RunTurnInput,
+    skills: PreparedSkillSelection,
+  ): void {
+    if (!this.preparedSkillSelections.has(skills)
+      || !sameNames(input.skills, skills.names)) {
+      throw new Error("Prepared Skill selection does not match this AgentLoop Turn");
+    }
+    this.preparedSkillSelections.delete(skills);
+  }
+
   private async enqueueSession<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.sessionTails.get(sessionId) ?? Promise.resolve();
     let release!: () => void;
@@ -320,13 +423,10 @@ export class AgentLoop {
     }
   }
 
-  private async resolveSystemPrompt(input: RunTurnInput): Promise<string> {
-    const skillInstructions: string[] = [];
-    if (input.skills?.length) {
-      if (!this.dependencies.skillLoader) throw new Error("No SkillLoader configured");
-      const loaded = await this.dependencies.skillLoader.load(input.skills);
-      skillInstructions.push(...loaded.map((skill) => skill.instructions));
-    }
+  private buildSystemPrompt(
+    input: RunTurnInput,
+    skillInstructions: readonly string[],
+  ): string {
     return this.modelRequestPlanner.buildPrompt(immutableSnapshot({
       promptInjections: input.promptInjections ?? [],
       skillInstructions,
@@ -480,21 +580,43 @@ export class AgentLoop {
 
   private createRunMutationGate(session: Session): RunMutationGate {
     let persistenceTail: Promise<void> = Promise.resolve();
+    let outcomeUnknown: SessionSaveOutcomeUnknownError | undefined;
     const checkpoint = async (
       mutate?: () => void,
       options?: SaveSessionOptions,
     ): Promise<void> => {
-      const pending = persistenceTail
-        .catch(() => undefined)
-        .then(async () => {
-          mutate?.();
-          await this.dependencies.sessionStore.save(session, options);
-        });
-      persistenceTail = pending.catch(() => undefined);
+      const pending = persistenceTail.then(async () => {
+        if (outcomeUnknown) throw outcomeUnknown;
+        mutate?.();
+        await this.dependencies.sessionStore.save(session, options);
+      });
+      persistenceTail = pending.then(
+        () => undefined,
+        (error: unknown) => {
+          if (error instanceof SessionSaveOutcomeUnknownError) outcomeUnknown ??= error;
+          // Definite checkpoint failures remain recoverable: terminal
+          // reconciliation may safely persist the current in-memory state.
+        },
+      );
       await pending;
     };
     return Object.freeze({ checkpoint });
   }
+}
+
+function assertUniqueNames(kind: string, names: readonly string[]): void {
+  if (new Set(names).size !== names.length) {
+    throw new Error(`Duplicate ${kind} capability`);
+  }
+}
+
+function sameNames(
+  left: readonly string[] | undefined,
+  right: readonly string[],
+): boolean {
+  const normalized = left ?? [];
+  return normalized.length === right.length
+    && normalized.every((name, index) => name === right[index]);
 }
 
 function createRunState(): RunState {
@@ -555,6 +677,14 @@ function normalizeToolCalls(calls: readonly ToolCall[] | undefined): ToolCall[] 
 
 function immutableSnapshot<T>(value: T): T {
   return deepFreeze(structuredClone(value));
+}
+
+function runPolicySessionSnapshot(session: Session): RunPolicySessionSnapshot {
+  return {
+    id: session.id,
+    messages: session.messages,
+    runState: session.runState,
+  };
 }
 
 function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {

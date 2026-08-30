@@ -7,7 +7,7 @@ import {
   MCPToolProvider,
   MCPToolProviderClosedError,
   type MCPClient,
-} from "../src/index.js";
+} from "../src/mcp.js";
 import type { ToolContext } from "../src/tools/base.js";
 
 const baseContext: ToolContext = {

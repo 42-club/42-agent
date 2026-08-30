@@ -5,16 +5,15 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   AgentLoop,
-  ConversationCompressionTool,
-  FileSessionStore,
   InMemorySessionStore,
-  SqliteSessionStore,
   ToolRegistry,
   createMessage,
   type ModelClient,
   type ModelRequest,
   type Session,
 } from "../src/index.js";
+import { FileSessionStore, SqliteSessionStore } from "../src/storage/index.js";
+import { ConversationCompressionTool } from "../src/tools/index.js";
 
 test("compression preserves complete assistant/tool batches and forwards cancellation", async () => {
   let receivedSignal: AbortSignal | undefined;

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { OpenRouterModelClient } from "../src/provider/index.js";
 import {
-  OpenRouterModelClient,
   estimateTokenUpperBound,
   type ModelRequest,
   type ModelStreamEvent,

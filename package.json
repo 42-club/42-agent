@@ -23,9 +23,29 @@
       "types": "./dist/src/acp/index.d.ts",
       "import": "./dist/src/acp/index.js"
     },
+    "./channel": {
+      "types": "./dist/src/channel/index.d.ts",
+      "import": "./dist/src/channel/index.js"
+    },
+    "./legacy": {
+      "types": "./dist/src/legacy/index.d.ts",
+      "import": "./dist/src/legacy/index.js"
+    },
+    "./mcp": {
+      "types": "./dist/src/mcp.d.ts",
+      "import": "./dist/src/mcp.js"
+    },
+    "./provider": {
+      "types": "./dist/src/provider/index.d.ts",
+      "import": "./dist/src/provider/index.js"
+    },
     "./storage": {
       "types": "./dist/src/storage/index.d.ts",
       "import": "./dist/src/storage/index.js"
+    },
+    "./tools": {
+      "types": "./dist/src/tools/index.d.ts",
+      "import": "./dist/src/tools/index.js"
     },
     "./package.json": "./package.json"
   },

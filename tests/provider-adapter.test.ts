@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { AdaptedModelClient } from "../src/provider/index.js";
 import {
-  AdaptedModelClient,
   AgentLoop,
   InMemorySessionStore,
   ToolRegistry,

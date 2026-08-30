@@ -3,7 +3,9 @@
 `AgentRuntime` is the protocol-neutral host boundary. All protocol/channel turns pass through it for
 session lifecycle, capability selection, cancellation, and close admission. It derives the canonical
 `SessionStore`, `ToolRegistry`, and Skill loader from `AgentLoop`; supplying different instances is rejected at
-construction. `AgentLoop`, its per-session coordinator, and that Store are the only source of truth for
+construction. A constructed Runtime is ready for use immediately, with `close()` as its terminal lifecycle
+transition.
+`AgentLoop`, its per-session coordinator, and that Store are the only source of truth for
 conversation and run state.
 The core Runtime does not bind Sessions to channels. A protocol adapter may still enforce admission and
 ownership before resolving an inbound event to a Session ID; ACP, in particular, accepts only ACP-bound
@@ -49,6 +51,8 @@ runtime/* policy plans ─┘
 - `skills.ts`: Load optional instructions. A Skill does not own tools, permissions, or sessions.
 - `mcp.ts`: Convert MCP tools into the same Tool interface used by local tools, apply host-owned trust and
   ordering policy, normalize failures, and own refresh/close lifecycle when using `MCPToolProvider`.
+- `legacy/`: Isolate deprecated compatibility APIs that can bypass current coordination invariants. It is
+  never re-exported by the core or `runtime/` barrels.
 - `session.ts`: Canonical messages and durable `RunState`/`ToolCallState`.
 - `agent-loop.ts`: The only core coordinator allowed to admit conversation and run-state mutations. It
   applies policy plans and remains responsible for FIFO admission, live state, tool authorization,
@@ -84,10 +88,27 @@ transport and Runtime lifecycle; each `AgentApp` enforces one live ACP client co
 
 `workspaceRoot` is mandatory and is canonicalized with `realpath`. A session request's `cwd` must resolve
 to that same host-enforced root; symlink aliases are accepted only when their canonical target matches.
-The adapter records the root in Session metadata and verifies it on resume, prompt, and delete. Existing
-Sessions with missing or foreign-root metadata are rejected without disclosing their ownership; missing
-resume/prompt targets fail while delete remains idempotent. Cancel targets only prompts admitted by this
-adapter, and protocol input never widens Tool roots.
+The adapter stores the root as a protected Runtime binding that generic metadata cannot forge. Resume,
+prompt, cancel, and delete check that binding inside the same Runtime admission/close gate as the operation,
+including a final re-check immediately before deletion. Existing Sessions with missing or foreign bindings
+are rejected without disclosing their ownership; missing resume/prompt targets fail while delete remains
+idempotent. Cancel targets only prompts admitted with the same binding, and protocol input never widens
+Tool roots.
+
+The protected value is an exact versioned envelope `{ version: 1, kind, value }` persisted through a
+Store-protected top-level field and, for database Stores, an independent column. Trust comes from that
+explicit Store capability and atomic write path, never from the envelope's shape in generic metadata.
+Consequently every generic `runtime.binding` value and the former `acp.cwd` marker lack trustworthy
+provenance; both are fail-closed quarantined and unbound protocol adapters project them as missing. Current
+generic Session metadata strips both keys. A custom Store must implement protected atomic create and
+one-time claim before bindings are enabled. A host may retain an origin/main-era ACP Session only through
+the optional
+`authorizeLegacySessionMigration` callback backed by a trusted Session-ID allowlist or external inventory;
+matching `cwd` metadata alone must never authorize migration. Once approved, `AgentRuntime` re-reads and
+validates the exact legacy marker within the Loop's per-Session FIFO, removes it, and performs a single
+versioned save. Save outcome-unknown is propagated without retry so the host must reload before deciding
+what happened. Pending authorization is an abortable adapter scope: delete/disconnect cancel and join it,
+and delete closes new resume/prompt admission before waiting.
 
 Update projection has a bounded pending count and per-delivery timeout. Backpressure, timeout, transport
 failure, request cancellation, session cancellation/deletion, and Runtime shutdown all terminate the
@@ -103,7 +124,9 @@ adapter boundary rather than ignored or injected into the Runtime.
 
 ## Concurrency
 
-Turns and explicit recovery are serialized FIFO per session within one runtime process. Session close
+Turns and explicit recovery are serialized FIFO per session within one runtime process. Runtime reserves
+that FIFO position before asynchronous Session lookup, binding checks, or Skill loading, so a later fast
+request cannot overtake an earlier request or decide its initial capability scope. Session close
 gates new work, cooperatively cancels admitted turns, waits for them to settle, and only then deletes state.
 Different sessions and independent runtime processes remain concurrent.
 Cancellation is checked again after a request waits for its FIFO slot: work cancelled before admission does
@@ -135,8 +158,13 @@ substitute for semantic ordering. `save` is update-only: it must fail if the Ses
 version changed. Without `rewriteMessages`, the persisted message prefix is immutable and only appends are
 accepted. File writes use a per-session queue, unique temporary files, fixed-length lowercase Session-ID
 digests with stored-ID verification, and atomic rename within the supported single-process model. Session
-IDs must be non-empty, well-formed Unicode. SQLite stores an explicit current Run ID rather than inferring
-it from wall-clock timestamps.
+IDs must be non-empty, NUL-free, well-formed Unicode. SQLite stores an explicit current Run ID rather than
+inferring it from wall-clock timestamps.
+
+Protected Session ownership is outside generic metadata. Supporting Stores advertise the capability,
+persist ownership atomically at create time or through a one-time versioned claim, and reject ordinary
+saves that add, remove, or replace it. The File Store writes a magic-framed exact container atomically;
+legacy raw Session JSON remains readable, but any top-level `ownership` in that old format is ignored.
 
 ## Database selection and lifecycle
 
@@ -161,12 +189,18 @@ Session version, messages, current Run, and tool calls in one transaction. A Sup
 PostgreSQL database URL (normally direct connection for a persistent backend, or session pooler when IPv4
 requires it); it does not use `supabase-js`, the REST/GraphQL Data API, or a browser key.
 
+If a Store loses the acknowledgement for a commit and cannot verify whether that checkpoint became
+durable, it throws `SessionSaveOutcomeUnknownError` and leaves the live Session version unchanged.
+`AgentLoop` propagates that error without attempting a terminal save from the stale object; the embedding
+host must reload before retrying or reconciling the Run.
+
 Opening a PostgreSQL-backed Store checks the schema by default. Applying DDL is explicit through the
 migration API or a deployment step; migration credentials may be separate from runtime credentials.
 Migrations are ordered, checksummed, transactionally applied under a database lock, and reject an unknown
 future version or a changed applied migration. When migration and runtime roles differ, deployment also
 grants the runtime role `USAGE` on the private schema, `SELECT` on migration history for readiness, and DML
-on the four data tables. A Supabase deployment invokes this explicit migration from its deployment
+on the four data tables; readiness verifies each of those privileges before admitting work. A Supabase
+deployment invokes this explicit migration from its deployment
 workflow; the runtime's migration history remains separate from Supabase's own migration table.
 
 The embedding host owns a managed Store. It calls `readinessCheck()` during startup as needed, closes
@@ -189,10 +223,10 @@ Three extracted policy objects reduce `AgentLoop` size without creating alternat
 publishes the corresponding event. This preserves one mutation-admission path and keeps durable state ahead
 of observer-visible terminal outcomes. For tool batches it creates a private per-Run `RunMutationGate` that
 couples each admitted mutation to a serialized checkpoint. The internal coordinated executor receives this
-narrow gate instead of `SessionStore`; policy objects never receive either one. The deprecated exported
-`ToolExecutor` is a compatibility facade for its original direct-construction API and is not part of the
-Loop's mutation path. Trusted write tools may still access the live Session only within their exclusive
-Loop-authorized barrier.
+narrow gate instead of `SessionStore`; policy objects never receive either one. The deprecated
+`ToolExecutor` is available only through the explicit `42-agent/legacy` compatibility entry point. It is
+not exported by the package root or the `runtime/` barrel and is not part of the Loop's mutation path.
+Trusted write tools may still access the live Session only within their exclusive Loop-authorized barrier.
 
 ## Safe recovery
 
@@ -241,3 +275,8 @@ type-checking, and the coverage-gated test run.
 The package is licensed under Apache-2.0 and configured for public npm publication. Public releases use
 semantic versions and require an explicit maintainer publish action; CI and `npm pack --dry-run` verify
 the artifact without publishing it.
+
+The package root is the protocol-neutral core. ACP, Channel, provider, storage, concrete Tool, MCP, and
+legacy compatibility APIs are exposed only through explicit package subpaths. This keeps importing the
+core from eagerly evaluating optional adapter dependency graphs and prevents internal Runtime policy
+objects from becoming accidental compatibility commitments.
