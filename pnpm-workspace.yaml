@@ -1,0 +1,4 @@
+# This package is installed independently from the applications that embed it.
+# No current dependency needs an install script; review new scripts explicitly.
+strictDepBuilds: true
+allowBuilds: {}

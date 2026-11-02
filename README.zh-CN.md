@@ -174,24 +174,35 @@ Mutation Gate，由该 Gate 把获准变更与其检查点串行绑定。已弃�
 
 需要 Node.js 22.13 或更高版本，推荐使用 Node.js 24 LTS。
 
+仓库开发固定使用 pnpm 10.34.5（`packageManager`）和 Node.js 24.22.1（`.nvmrc`）。本仓库独立安装；
+Hub 等应用继续通过发布包或 tarball 使用它。提交 `pnpm-lock.yaml`，CI 使用冻结锁文件安装。
+当前依赖不需要安装脚本，`pnpm-workspace.yaml` 会拒绝未经审查的依赖构建脚本。
+
 ```bash
-npm install
-npm test
-npm run example
+pnpm install --frozen-lockfile
+pnpm test
+pnpm run example
 ```
 
 各项工程检查既可单独运行，也可通过统一的本地门禁执行：
 
 ```bash
-npm run lint
-npm run typecheck
-npm run coverage
-npm run check
+pnpm run lint
+pnpm run typecheck
+pnpm run coverage
+pnpm run check
 ```
 
-`npm run coverage` 会运行测试，并对 `dist/src` 强制要求行/语句覆盖率至少 85%、分支至少 75%、
+`pnpm run coverage` 会运行测试，并对 `dist/src` 强制要求行/语句覆盖率至少 85%、分支至少 75%、
 函数至少 80%。GitHub Actions 会在 Node.js 22.13、24 和 26 上执行 Lint、类型检查、覆盖率门禁及
-`npm pack --dry-run`。
+`pnpm pack --dry-run`。
+
+完整测试需要 `/bin/bash` 和创建符号链接的权限，应在具备这些条件的 POSIX 环境（如 Linux CI）运行。
+缺少这些条件的原生 Windows 已存在 Bash 和符号链接测试失败；PostgreSQL 集成测试还需要
+`TEST_POSTGRES_URL`。各平台的覆盖率门槛保持不变。
+
+使用 `pnpm pack --pack-destination <输出目录>` 为应用生成包，`prepack` 会构建 JavaScript 和类型声明。
+先在独立消费项目中验证，再更新 Hub 的 vendor 包；打包不会发布到 npm，也不会替换其他应用的依赖。
 
 Package 根入口只导出协议无关核心：`AgentLoop`、`AgentRuntime`、规范 Model/Session 契约、Skill 与
 `ToolRegistry`。集成能力使用明确的公开子路径：
@@ -211,7 +222,7 @@ Package 根入口只导出协议无关核心：`AgentLoop`、`AgentRuntime`、�
 映射为协议自身的 Stop Reason）。此外，`SessionInfo.skills` 与 `SessionInfo.tools` 已改为明确的
 `CapabilityScope` 判别联合；调用方应先按 `mode` 分支，再读取 `names`，不能继续把它们当作数组。
 项目采用 [Apache-2.0](./LICENSE) 许可证，并已配置为可公开发布到 npm。公开发布使用语义化版本，
-且必须由维护者显式执行；`npm pack --dry-run` 只校验发布内容，不会实际发布。
+且必须由维护者显式执行；`pnpm pack --dry-run` 只校验发布内容，不会实际发布。
 
 ## 托管数据库存储
 
@@ -320,7 +331,7 @@ export OPENROUTER_API_KEY=...
 export AGENT_POSTGRES_URL=postgresql://...
 # 或：export SUPABASE_DATABASE_URL=postgresql://...
 # 第一次显式迁移：export AGENT_DATABASE_SCHEMA_MODE=migrate
-npm run runtime
+pnpm run runtime
 ```
 
 如果两个远程 URL 都未设置，示例会使用配置的 SQLite 文件。完整环境变量映射与响应
@@ -335,7 +346,7 @@ HTTP Server 是可信开发环境下的 Adapter，不是生产入口：它不提
 随后使用显式 Session ID 启动 CLI：
 
 ```bash
-npm run cli -- --session shared-session
+pnpm run cli --session shared-session
 ```
 
 其他 Channel 只要解析到 `shared-session`，即可继续同一个规范化服务端 Session。
