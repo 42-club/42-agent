@@ -1,6 +1,7 @@
 {
   "name": "42-agent",
   "version": "0.1.0",
+  "packageManager": "pnpm@10.34.5",
   "description": "Protocol-neutral single-process runtime for production AI agents",
   "license": "Apache-2.0",
   "keywords": [
@@ -61,16 +62,16 @@
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
-    "build": "npm run clean && tsc -p tsconfig.json",
+    "build": "pnpm run clean && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint . --max-warnings=0",
-    "test": "npm run build && node --test --test-timeout=60000 dist/tests/*.test.js",
-    "coverage": "npm run build && c8 --all --include='dist/src/**/*.js' --check-coverage --lines 85 --branches 75 --functions 80 --statements 85 node --test --test-timeout=60000 dist/tests/*.test.js",
-    "check": "npm run lint && npm run typecheck && npm run coverage",
-    "prepack": "npm run build",
-    "example": "npm run build && node dist/examples/minimal.js",
-    "runtime": "npm run build && node dist/examples/runtime-server.js",
-    "cli": "npm run build && node dist/src/channel/cli/main.js"
+    "test": "pnpm run build && node --test --test-timeout=60000 dist/tests/*.test.js",
+    "coverage": "pnpm run build && c8 --all --include=\"dist/src/**/*.js\" --check-coverage --lines 85 --branches 75 --functions 80 --statements 85 node --test --test-timeout=60000 dist/tests/*.test.js",
+    "check": "pnpm run lint && pnpm run typecheck && pnpm run coverage",
+    "prepack": "pnpm run build",
+    "example": "pnpm run build && node dist/examples/minimal.js",
+    "runtime": "pnpm run build && node dist/examples/runtime-server.js",
+    "cli": "pnpm run build && node dist/src/channel/cli/main.js"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
