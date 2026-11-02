@@ -269,11 +269,11 @@ The OpenRouter adapter requires its protocol-level `[DONE]` marker and treats pr
 
 The supported engine floor is Node.js 22.13; Node.js 24 LTS is recommended. CI verifies Node.js 22.13,
 24, and 26 with lint, type-checking, tests, package inspection, and coverage gates of 85% lines/statements,
-75% branches, and 80% functions across production output. Locally, `npm run check` composes lint,
+75% branches, and 80% functions across production output. Locally, `pnpm run check` composes lint,
 type-checking, and the coverage-gated test run.
 
 The package is licensed under Apache-2.0 and configured for public npm publication. Public releases use
-semantic versions and require an explicit maintainer publish action; CI and `npm pack --dry-run` verify
+semantic versions and require an explicit maintainer publish action; CI and `pnpm pack --dry-run` verify
 the artifact without publishing it.
 
 The package root is the protocol-neutral core. ACP, Channel, provider, storage, concrete Tool, MCP, and

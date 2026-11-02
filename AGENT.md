@@ -168,7 +168,7 @@ For changes to orchestration, sessions, tool execution, recovery, channels, or A
 - preserve cancellation, join, version, observer-isolation, and checkpoint semantics
 - add fault-injection tests for races, cancellation, observer failure, stale writes, and adapter boundaries
 - update `README.md` and `ARCHITECTURE.md` when guarantees or responsibilities change
-- keep the package entry point, declarations, Node engine, and `npm pack` consumer surface working
+- keep the package entry point, declarations, Node engine, and `pnpm pack` consumer surface working
 
 Prefer small adapters and explicit interfaces over a second orchestration path. If a requested feature
 requires shared state or coordination between independent agent processes, implement it in the calling

@@ -194,24 +194,38 @@ execute capabilities. See
 
 Requires Node.js 22.13 or newer. Node.js 24 LTS is recommended.
 
+Repository development uses pnpm 10.34.5 (`packageManager`) and Node.js 24.22.1 (`.nvmrc`). Install this
+repository independently; applications such as Hub continue consuming a published package or tarball.
+Commit `pnpm-lock.yaml`; CI installs with `--frozen-lockfile`. No current dependency needs an install
+script, so `pnpm-workspace.yaml` rejects unreviewed dependency builds.
+
 ```bash
-npm install
-npm test
-npm run example
+pnpm install --frozen-lockfile
+pnpm test
+pnpm run example
 ```
 
 Engineering checks are available separately or as one local gate:
 
 ```bash
-npm run lint
-npm run typecheck
-npm run coverage
-npm run check
+pnpm run lint
+pnpm run typecheck
+pnpm run coverage
+pnpm run check
 ```
 
-`npm run coverage` runs the test suite and enforces at least 85% lines/statements, 75% branches, and 80%
+`pnpm run coverage` runs the test suite and enforces at least 85% lines/statements, 75% branches, and 80%
 functions across `dist/src`. GitHub Actions runs lint, type-checking, coverage gates, and
-`npm pack --dry-run` on Node.js 22.13, 24, and 26.
+`pnpm pack --dry-run` on Node.js 22.13, 24, and 26.
+
+The complete test suite requires `/bin/bash` and permission to create symbolic links; run it in a
+suitable POSIX environment such as the Linux CI runners. Native Windows without those facilities has
+existing Bash/symlink test failures. PostgreSQL integration tests additionally require `TEST_POSTGRES_URL`.
+Coverage thresholds remain enforced on all platforms.
+
+To build an archive for a consumer, run `pnpm pack --pack-destination <output-directory>`; `prepack`
+builds the JavaScript and declarations. Verify the archive in an isolated consumer before updating
+Hub's vendored tarball. Packing does not publish or replace another application's package.
 
 The package root exports only the protocol-neutral core: `AgentLoop`, `AgentRuntime`, canonical model and
 Session contracts, Skills, and `ToolRegistry`. Integrations use explicit public subpaths:
@@ -233,7 +247,7 @@ as errors (ACP maps cancellation to its own protocol stop reason). Finally, `Ses
 `SessionInfo.tools` are now the explicit `CapabilityScope` union—branch on `mode` before reading `names`
 instead of treating either field as an array.
 It is licensed under [Apache-2.0](./LICENSE) and configured for public npm publication. Public releases
-use semantic versions and remain an explicit maintainer action; `npm pack --dry-run` verifies package
+use semantic versions and remain an explicit maintainer action; `pnpm pack --dry-run` verifies package
 contents without publishing them.
 
 ## Managed database storage
@@ -348,7 +362,7 @@ export OPENROUTER_API_KEY=...
 export AGENT_POSTGRES_URL=postgresql://...
 # Or: export SUPABASE_DATABASE_URL=postgresql://...
 # For an explicit first migration: export AGENT_DATABASE_SCHEMA_MODE=migrate
-npm run runtime
+pnpm run runtime
 ```
 
 With neither remote URL set, the example uses the configured SQLite file. Its complete environment mapping
@@ -364,7 +378,7 @@ limits, and deployment policy in the embedding application.
 Then use the CLI with an explicit session ID:
 
 ```bash
-npm run cli -- --session shared-session
+pnpm run cli --session shared-session
 ```
 
 Another channel that resolves to `shared-session` will continue the same canonical session.
